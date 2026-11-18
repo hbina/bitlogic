@@ -1,6 +1,6 @@
 # Bitlogic
 
-**Last updated: 2026-11-09.** An untimed Rust DSL for pure bit-vector
+**Last updated: 2026-11-18.** An untimed Rust DSL for pure bit-vector
 transformations: `F: Input -> Output`. Write immutable expressions and return a
 complete struct, capture a typed expression graph, then interpret it or emit
 combinational Verilog. The native function remains callable. Clocking, reset,
@@ -98,7 +98,7 @@ outputs match the pre-migration HDL.
 
 | Feature | Status | Evidence/scope |
 |---|---|---|
-| Rust frontend | Partial | Immutable owned input/output values, nested structs, value conditionals and bounded folds; native/IR/Icarus agreement, documented subset |
+| Rust frontend | Partial | Immutable owned input/output values, nested structs, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, documented subset |
 | Bit-vector IR and composition | Verified | Independent truth tables, all eleven three-bit binary operations, composition identities, port-shape/value errors, and width boundaries in integration tests |
 | Combinational Verilog | Partial | Icarus checks 128 conditional-transform combinations and 2,725 operator/boundary cases; no synthesis or board evidence |
 | Pure structured interfaces | Verified | Six structured integration tests, schema round trips, nominal composition laws, dependency expectations, and ten compile-fail examples; complete returned values |
@@ -117,7 +117,7 @@ outputs match the pre-migration HDL.
 | Generic synthesis | Verified | Yosys 0.70: 2,165 generic logic cells + 122 flops; structural check and complete mapped processor regression pass; no technology area/timing claim |
 | SKY130 HD block implementation | Partial | Fresh migrated RTL at TT/25 °C/1.8 V: 15,713.8 µm² cell area, +10.3544 ns setup / +0.253807 ns hold slack at 20 ns; router DRC/antenna zero, constraint audit and routed regression pass; no chip signoff |
 
-`cargo test --workspace --locked`: **42 tests and 11 doctests pass** (10 compile-fail).
+`cargo test --workspace --locked`: **45 tests and 13 doctests pass** (11 compile-fail).
 `cargo fmt --all --check`, Clippy with warnings denied, and `make emit example`
 pass locally. CI runs the same Rust and HDL checks; no remote execution is claimed.
 Exact scope is in [verification](docs/verification.md).
@@ -136,6 +136,7 @@ examples export artifacts without arguments; protocol builders and execution che
 - [x] Implement and exhaustively verify a bounded set example.
 - [x] Generate all example HDL/diagram artifacts into random `/tmp` directories without CLI modes.
 - [x] Add a fixed-four-byte combinational CRC-8 example with independent native/IR/HDL checks.
+- [x] Allow `#[logic]` functions to call other `#[logic]` functions (inlined, any arity).
 - [x] Retire protocol crates and the processor backend from the active tree.
 - [x] Document the [processor and protocol implementation plan](docs/protocol_processor_plan.md) using bitlogic as a library.
 - [x] Implement a processor example with checked ISA, independent cycle model, and clocked HDL verification.

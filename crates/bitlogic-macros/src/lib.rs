@@ -160,6 +160,30 @@ impl Lower {
         };
         self.expr(expr, &env)
     }
+    /// Inline a call to another `#[logic]` function. The callee's macro
+    /// expansion provides `<path>::__lower`, which builds its graph into the
+    /// caller's builder; the native call is ordinary Rust.
+    fn call(&mut self, call: &syn::ExprCall, path: &syn::Path, env: &Env) -> syn::Result<Tokens> {
+        if path
+            .segments
+            .iter()
+            .any(|s| !matches!(s.arguments, PathArguments::None))
+        {
+            return Err(error(
+                path,
+                "#[logic] functions are non-generic; remove the generic arguments",
+            ));
+        }
+        let mut args = Vec::new();
+        for arg in &call.args {
+            args.push(self.expr(arg, env)?);
+        }
+        Ok(self.emit(quote!(#path::__lower(
+            __logic_builder,
+            ::std::vec![#(#args.clone()),*],
+            __logic_depth + 1,
+        )?)))
+    }
     fn expr(&mut self, expr: &Expr, env: &Env) -> syn::Result<Tokens> {
         self.tick(expr)?;
         match expr {
@@ -193,12 +217,11 @@ impl Lower {
                     quote!(::bitlogic::__private::Symbolic::structure::<#ty>(vec![#(#fields),*])?),
                 ))
             }
-            Expr::Lit(lit) if matches!(lit.lit, syn::Lit::Bool(_)) => Ok(self.emit(
-                quote!(::bitlogic::__private::Symbolic::constant(&mut __logic_builder, #lit)?),
-            )),
+            Expr::Lit(lit) if matches!(lit.lit, syn::Lit::Bool(_)) => Ok(self
+                .emit(quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #lit)?))),
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Not(_)) => {
                 let a = self.expr(&u.expr, env)?;
-                Ok(self.emit(quote!(#a.not(&mut __logic_builder)?)))
+                Ok(self.emit(quote!(#a.not(__logic_builder)?)))
             }
             Expr::Binary(b) => {
                 let a = self.expr(&b.left, env)?;
@@ -206,7 +229,7 @@ impl Lower {
                     let amount = u32::try_from(integer(&b.right)?)
                         .map_err(|_| error(b, "shift literal exceeds u32"))?;
                     let left = matches!(b.op, syn::BinOp::Shl(_));
-                    return Ok(self.emit(quote!(#a.shift(&mut __logic_builder,#amount,#left)?)));
+                    return Ok(self.emit(quote!(#a.shift(__logic_builder,#amount,#left)?)));
                 }
                 let rhs = self.expr(&b.right, env)?;
                 let op = match b.op {
@@ -226,19 +249,25 @@ impl Lower {
                 let op = format_ident!("{op}");
                 let logical = matches!(b.op, syn::BinOp::And(_) | syn::BinOp::Or(_));
                 Ok(self.emit(
-                    quote!(#a.binary(&mut __logic_builder,::bitlogic::Binary::#op,&#rhs,#logical)?),
+                    quote!(#a.binary(__logic_builder,::bitlogic::Binary::#op,&#rhs,#logical)?),
                 ))
             }
             Expr::Call(call) => {
                 let Expr::Path(path) = &*call.func else {
-                    return Err(error(call, "only bits::<N>(literal) calls are supported"));
-                };
-                let last = path.path.segments.last().unwrap();
-                if last.ident != "bits" || call.args.len() != 1 {
                     return Err(error(
                         call,
-                        "only bits::<N>(literal) calls are supported; compose graphs with then()",
+                        "only bits::<N>(literal) and calls to #[logic] functions by path are supported",
                     ));
+                };
+                if path.qself.is_some() {
+                    return Err(error(call, "call #[logic] functions by plain path"));
+                }
+                let last = path.path.segments.last().unwrap();
+                if last.ident != "bits" {
+                    return self.call(call, &path.path, env);
+                }
+                if call.args.len() != 1 {
+                    return Err(error(call, "bits requires one integer literal"));
                 }
                 let generic = generic_integers(&last.arguments)?;
                 if generic.len() != 1 || !(1..=64).contains(&generic[0]) {
@@ -246,7 +275,7 @@ impl Lower {
                 }
                 let n = generic[0] as usize;
                 let value = integer(&call.args[0])?;
-                Ok(self.emit(quote!(::bitlogic::__private::Symbolic::constant(&mut __logic_builder,::bitlogic::bits::<#n>(#value))?)))
+                Ok(self.emit(quote!(::bitlogic::__private::Symbolic::constant(__logic_builder,::bitlogic::bits::<#n>(#value))?)))
             }
             Expr::If(branch) => {
                 let c = self.expr(&branch.cond, env)?;
@@ -256,7 +285,7 @@ impl Lower {
                 };
                 let n = self.expr(otherwise, env)?;
                 Ok(self.emit(
-                    quote!(::bitlogic::__private::Symbolic::mux(&mut __logic_builder,&#c,&#y,&#n)?),
+                    quote!(::bitlogic::__private::Symbolic::mux(__logic_builder,&#c,&#y,&#n)?),
                 ))
             }
             Expr::MethodCall(call) => {
@@ -304,7 +333,7 @@ impl Lower {
                         }
                         let mut value = a;
                         for i in 0..count {
-                            let idx = self.emit(quote!(::bitlogic::__private::Symbolic::constant(&mut __logic_builder,::bitlogic::bits::<8>(#i))?));
+                            let idx = self.emit(quote!(::bitlogic::__private::Symbolic::constant(__logic_builder,::bitlogic::bits::<8>(#i))?));
                             let mut inner = env.clone();
                             inner.insert(clean(acc), value.clone());
                             inner.insert(clean(index), idx);
@@ -327,7 +356,7 @@ impl Lower {
                             u8::try_from(width).map_err(|_| error(call, "slice out of bounds"))?;
                         let offset = u8::try_from(integer(&call.args[0])?)
                             .map_err(|_| error(call, "slice out of bounds"))?;
-                        Ok(self.emit(quote!(#a.slice(&mut __logic_builder,#offset,#width,#bit)?)))
+                        Ok(self.emit(quote!(#a.slice(__logic_builder,#offset,#width,#bit)?)))
                     }
                     "concat" if call.args.len() == 1 && generic.len() == 2 => {
                         let b = self.expr(&call.args[0], env)?;
@@ -335,7 +364,7 @@ impl Lower {
                             .map_err(|_| error(call, "concatenation width mismatch"))?;
                         let total = u8::try_from(generic[1])
                             .map_err(|_| error(call, "concatenation width mismatch"))?;
-                        Ok(self.emit(quote!(#a.concat(&mut __logic_builder,&#b,#low,#total)?)))
+                        Ok(self.emit(quote!(#a.concat(__logic_builder,&#b,#low,#total)?)))
                     }
                     _ => Err(error(
                         call,
@@ -368,11 +397,10 @@ fn expand(function: ItemFn) -> syn::Result<Tokens> {
         || sig.variadic.is_some()
         || !sig.generics.params.is_empty()
         || sig.generics.where_clause.is_some()
-        || sig.inputs.len() != 1
     {
         return Err(error(
             sig,
-            "logic functions require exactly one owned input and an explicit output type",
+            "logic functions must be ordinary non-generic functions with owned inputs and an explicit output type",
         ));
     }
     let syn::ReturnType::Type(_, output) = &sig.output else {
@@ -382,34 +410,70 @@ fn expand(function: ItemFn) -> syn::Result<Tokens> {
         ));
     };
     value_type(output)?;
-    let FnArg::Typed(arg) = &sig.inputs[0] else {
-        return Err(error(sig, "logic functions cannot have receivers"));
-    };
-    value_type(&arg.ty)?;
-    let parameter = immutable_binding(&arg.pat)?;
-    let root = clean(parameter);
-    let input = &arg.ty;
     let mut lower = Lower::default();
-    let value = lower.emit(
-        quote!(::bitlogic::__private::Symbolic::input::<#input>(&mut __logic_builder,#root)?),
-    );
-    let env = BTreeMap::from([(root, value)]);
+    let mut env = Env::new();
+    let mut inputs = Vec::new();
+    for (index, arg) in sig.inputs.iter().enumerate() {
+        let FnArg::Typed(arg) = arg else {
+            return Err(error(sig, "logic functions cannot have receivers"));
+        };
+        value_type(&arg.ty)?;
+        let name = clean(immutable_binding(&arg.pat)?);
+        if env.contains_key(&name) {
+            return Err(error(arg, "logic parameters must have distinct names"));
+        }
+        let ty = &arg.ty;
+        lower
+            .statements
+            .push(quote!(__logic_args[#index].require::<#ty>()?;));
+        env.insert(name.clone(), quote!(__logic_args[#index]));
+        inputs.push((name, ty));
+    }
     let result = lower.block(&function.block, &env)?;
     let statements = lower.statements;
+    let arity = inputs.len();
     let name = &sig.ident;
     let vis = &function.vis;
+    // Only single-input functions are complete circuits with an input schema;
+    // other arities are helpers that callers inline.
+    let ir = if let [(root, input)] = inputs.as_slice() {
+        quote! {
+            pub fn ir() -> ::std::result::Result<::bitlogic::Logic,::bitlogic::Error> {
+                let mut __logic_builder = ::bitlogic::Builder::default();
+                let input = ::bitlogic::__private::Symbolic::input::<#input>(&mut __logic_builder,#root)?;
+                let result = Self::__lower(&mut __logic_builder, ::std::vec![input], 0)?;
+                result.output(&mut __logic_builder)?;
+                __logic_builder.finish()?.with_schemas(<#input as ::bitlogic::LogicValue>::schema(),<#output as ::bitlogic::LogicValue>::schema())
+            }
+        }
+    } else {
+        quote!()
+    };
     Ok(quote! {
         #function
         #[allow(non_camel_case_types)]
         #vis struct #name {}
         impl #name {
-            pub fn ir() -> ::std::result::Result<::bitlogic::Logic,::bitlogic::Error> {
-                let mut __logic_builder = ::bitlogic::Builder::default();
+            #ir
+            /// Build this function's graph into `__logic_builder` from
+            /// already-lowered arguments. Used by calling `#[logic]` functions.
+            #[doc(hidden)]
+            #[allow(unused_mut, unused_variables)]
+            pub fn __lower(
+                __logic_builder: &mut ::bitlogic::Builder,
+                __logic_args: ::std::vec::Vec<::bitlogic::__private::Symbolic>,
+                __logic_depth: usize,
+            ) -> ::std::result::Result<::bitlogic::__private::Symbolic,::bitlogic::Error> {
+                if __logic_depth > ::bitlogic::__private::MAX_CALL_DEPTH {
+                    return Err(::bitlogic::Error("logic call depth exceeds 64 (recursive #[logic] call?)".into()));
+                }
+                if __logic_args.len() != #arity {
+                    return Err(::bitlogic::Error("logic call argument count mismatch".into()));
+                }
                 let mut __logic_values: ::std::vec::Vec<::bitlogic::__private::Symbolic> = ::std::vec::Vec::new();
                 #(#statements)*
                 #result.require::<#output>()?;
-                #result.output(&mut __logic_builder)?;
-                __logic_builder.finish()?.with_schemas(<#input as ::bitlogic::LogicValue>::schema(),<#output as ::bitlogic::LogicValue>::schema())
+                Ok(#result.clone())
             }
         }
     })
@@ -427,7 +491,10 @@ mod tests {
             ("fn f(a:bool)->bool {a=false;a}", "immutable let"),
             ("fn f(a:bool)->bool {return a;}", "trailing"),
             ("fn f(a:bool)->bool {if a {true}}", "require else"),
-            ("fn f(a:bool,b:bool)->bool {a}", "exactly one"),
+            ("fn f(a:bool,a:bool)->bool {a}", "distinct"),
+            ("fn f<T>(a:bool)->bool {a}", "non-generic"),
+            ("fn f(a:bool)->bool {g::<1>(a)}", "non-generic"),
+            ("fn f(a:bool)->bool {(g)(a)}", "by path"),
             ("fn f(a:bool) {a}", "explicit output"),
             (
                 "fn f(a:bool)->bool {a.fold::<257>(|acc,i| acc)}",

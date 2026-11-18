@@ -160,10 +160,22 @@ accumulators. Invalid bit/slice/concat bounds fail during capture.
 
 A macro unit test checks mutation/reference/assignment rejection, invalid
 signatures, missing else/early returns, iteration/work limits and validation of
-zero-iteration fold bodies. Ten compile-fail doctests cover mutation, references,
-missing fields, incompatible branches, unsupported leaf types, invalid function
-arity, reassignment, early return, struct updates and tuple structs. One executable
-doctest checks pure structured native/IR evaluation and HDL construction.
+zero-iteration fold bodies, duplicate parameters and generic/non-path calls.
+Eleven compile-fail doctests cover mutation, references, missing fields,
+incompatible branches, unsupported leaf types, `ir()` on a multi-input helper,
+calls to ordinary Rust functions, reassignment, early return, struct updates and
+tuple structs. Two executable doctests check pure structured native/IR evaluation
+and HDL construction, and helper calls over all 256 bytes.
+
+## Calls between logic functions (2026-11-18)
+
+`tests/calls.rs` checks a function built from zero-, one-, two- and three-input
+helpers, struct arguments and results, a module-path call, a call inside an `if`
+and calls inside an eight-iteration fold. All 256 inputs match an independent
+oracle (`format!("{:02X}")`, `count_ones`, wrapping addition) in native Rust,
+the IR and Icarus-simulated HDL. It also checks that inlining adds no ports,
+that a single-input helper still has its own `ir()`, and that a recursive call
+terminates natively but fails during capture with a depth error.
 
 The [migration audit](pure_functions.md) records baseline and current evidence.
 The integer processor reference and protocol oracle logic are preserved.

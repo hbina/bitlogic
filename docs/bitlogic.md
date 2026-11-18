@@ -42,8 +42,9 @@ adapters through ordinary Rust trait resolution. No global registry is used.
 Leaves are `bool` and unsigned `Bits<N>`, widths 1 through 64. Named non-generic
 structs derive `LogicValue` and may nest other derived structs. Deriving `Copy`
 and `Clone` is useful for native expression reuse. Leaf and struct values can be
-inputs or outputs; the input and output types need not be the same. Group multiple
-logical inputs into one struct.
+inputs or outputs; the input and output types need not be the same. A circuit (a
+function with `ir()`) groups multiple logical inputs into one struct; helpers
+called from other `#[logic]` functions may take several arguments.
 
 `bits::<N>(value)` masks its literal to N bits. Addition/subtraction wrap at N bits
 in every build profile. Comparisons are unsigned; shifts that shift all bits out
@@ -67,8 +68,16 @@ composes transformations; it does not introduce two hardware cycles.
 
 ## Supported Rust subset
 
-- Ordinary non-generic functions with exactly one named owned input and an explicit
-  owned output type. Both types must implement `LogicValue`.
+- Ordinary non-generic functions with named owned inputs and an explicit owned
+  output type, all implementing `LogicValue`. Only single-input functions get
+  `ir()`; functions with zero or several inputs are helpers for other `#[logic]`
+  functions.
+- Calls to other `#[logic]` functions by path (`helper(a, b)`,
+  `module::helper(x)`), including inside conditionals and folds. Each call
+  inlines the callee's graph at the call site: no ports, registers or sharing
+  are added, and two calls produce two copies of the logic. Callees must be
+  `#[logic]` functions; calling an ordinary Rust function is a compile error.
+  Recursion is rejected by `ir()` at a nesting depth of 64.
 - Initialized immutable `let` bindings, optional value type annotations, immutable
   shadowing, nested value blocks and a trailing expression.
 - Named field access and complete named struct construction, including qualified
@@ -82,7 +91,7 @@ composes transformations; it does not introduce two hardware cycles.
 - Explicit bounded immutable folds as described below.
 
 Mutation, references, assignment statements, compound assignments, early returns,
-struct-update syntax, destructuring, tuples/arrays/enums, arbitrary helper calls,
+struct-update syntax, destructuring, tuples/arrays/enums, calls to non-`#[logic]` functions,
 ordinary loops, async/unsafe functions, and arbitrary leaf types are unsupported.
 `LogicValue` derives require nonempty named non-generic structs. Rust names are
 resolved normally for schemas; recognized DSL operations such as `bits` are

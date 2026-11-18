@@ -1,7 +1,9 @@
 # Pure structured functions: language contract and migration
 
 The replacement frontend describes total combinational functions `F: Input -> Output`.
-A function has exactly one owned argument and one explicit return type. Leaves
+A circuit function has exactly one owned argument and one explicit return type;
+`#[logic]` helpers may take any number of owned arguments and are inlined at
+each call site. Leaves
 are `bool` and unsigned `Bits<1..=64>`; named structs derive `LogicValue` and may
 contain other derived structs. Struct field order determines depth-first leaf
 order. `bool` and `Bits<1>` have different logical types. Native Rust remains
@@ -29,7 +31,9 @@ arithmetic wraps at the leaf width and shifts beyond the width return zero.
 Every conditional returns the same logical type on both paths; aggregate
 conditionals select corresponding leaves. Only the final expression returns.
 Mutation, references, early returns, implicit holds, struct-update shorthand,
-arbitrary helper calls, loops and unsupported Rust types are rejected.
+calls to non-`#[logic]` functions, loops and unsupported Rust types are rejected.
+Calls between `#[logic]` functions inline the callee graph; recursion fails
+during capture.
 Explicit bounded `value.fold::<N>(|acc, index| expression)` provides immutable
 unrolling (0..=256 iterations, eight-bit index, existing lowering work bound).
 No iteration adds registers or elapsed time. No global type registry is used.
