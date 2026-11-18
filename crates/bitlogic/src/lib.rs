@@ -45,6 +45,53 @@
 //! # Ok::<(), bitlogic::Error>(())
 //! ```
 //!
+//! Fixed-length arrays index with a literal (`t[2]`) or, through
+//! [`LogicArray`], with a run-time `Bits` index: `at` reads (the zero value
+//! past the end) and `set` returns an updated copy. Fieldless enums derive
+//! `LogicValue` and are matched with constant patterns.
+//! ```
+//! use bitlogic::{logic, bits, Bits, LogicValue};
+//! #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]
+//! enum Op { Read, Write, Clear }
+//! #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]
+//! struct Regs { file: [Bits<8>; 4], op: Op, at: Bits<2>, data: Bits<8> }
+//! #[logic]
+//! fn regs(r: Regs) -> Regs {
+//!     let file = match r.op {
+//!         Op::Read => r.file,
+//!         Op::Write => r.file.set(r.at, r.data),
+//!         Op::Clear => [bits::<8>(0); 4],
+//!     };
+//!     Regs { file, op: r.op, at: r.at, data: r.file.at(r.at) }
+//! }
+//! let r = Regs { file: [bits(1), bits(2), bits(3), bits(4)], op: Op::Write,
+//!                at: bits(2), data: bits(9) };
+//! let want = Regs { file: [bits(1), bits(2), bits(9), bits(4)], data: bits(3), ..r };
+//! assert_eq!(regs(r), want);
+//! assert_eq!(regs::ir()?.evaluate_typed::<_, Regs>(r)?, want);
+//! # Ok::<(), bitlogic::Error>(())
+//! ```
+//!
+//! A run-time index needs `at`, not `[]`:
+//! ```compile_fail
+//! use bitlogic::{logic, Bits};
+//! #[logic]
+//! fn pick(t: [Bits<8>; 4]) -> Bits<8> { t[t[0]] }
+//! ```
+//!
+//! Match guards are unsupported:
+//! ```compile_fail
+//! use bitlogic::logic;
+//! #[logic]
+//! fn guarded(a: bool) -> bool { match a { true if a => false, _ => true } }
+//! ```
+//!
+//! Derived enums must be fieldless:
+//! ```compile_fail
+//! use bitlogic::LogicValue;
+//! #[derive(LogicValue)] enum Tagged { A(bool), B }
+//! ```
+//!
 //! Mutation is outside the language:
 //! ```compile_fail
 //! use bitlogic::logic;
@@ -74,7 +121,7 @@
 //! fn mismatched(input: bool) -> Bits<8> { if input { bits::<8>(1) } else { false } }
 //! ```
 //!
-//! Arbitrary Rust leaf types are unsupported:
+//! Arbitrary Rust leaf types (here `u8`) are unsupported:
 //! ```compile_fail
 //! use bitlogic::{logic, LogicValue};
 //! #[derive(Clone, Copy, LogicValue)] struct Unsupported { number: u8 }
@@ -129,7 +176,7 @@
 mod ir;
 mod value;
 pub use bitlogic_macros::{LogicValue, logic};
-pub use value::{LogicValue, Schema};
+pub use value::{LogicArray, LogicValue, Schema};
 #[doc(hidden)]
 pub mod __private {
     pub use crate::value::Symbolic;

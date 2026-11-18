@@ -136,19 +136,10 @@ impl Logic {
         let mut dependencies: Vec<std::collections::BTreeSet<usize>> = Vec::new();
         for node in &self.nodes {
             let mut set = std::collections::BTreeSet::new();
-            let sources = match node.operation {
-                Operation::Input(index) => {
-                    set.insert(index);
-                    vec![]
-                }
-                Operation::Constant(_) => vec![],
-                Operation::Not(a)
-                | Operation::Slice { value: a, .. }
-                | Operation::Shift { value: a, .. } => vec![a],
-                Operation::Binary(_, a, b) | Operation::Concat(a, b) => vec![a, b],
-                Operation::Mux { condition, yes, no } => vec![condition, yes, no],
-            };
-            for source in sources {
+            if let Operation::Input(index) = node.operation {
+                set.insert(index);
+            }
+            for source in operands(&node.operation) {
                 set.extend(&dependencies[source.0]);
             }
             dependencies.push(set);
@@ -211,43 +202,7 @@ impl Logic {
         for node in &self.nodes {
             let value = match node.operation {
                 Operation::Input(index) => inputs[index],
-                Operation::Constant(value) => value,
-                Operation::Not(a) => !values[a.0],
-                Operation::Binary(op, a, b) => {
-                    let (a, b) = (values[a.0], values[b.0]);
-                    match op {
-                        Binary::And => a & b,
-                        Binary::Or => a | b,
-                        Binary::Xor => a ^ b,
-                        Binary::Add => a.wrapping_add(b),
-                        Binary::Sub => a.wrapping_sub(b),
-                        Binary::Eq => u64::from(a == b),
-                        Binary::Ne => u64::from(a != b),
-                        Binary::Lt => u64::from(a < b),
-                        Binary::Le => u64::from(a <= b),
-                        Binary::Gt => u64::from(a > b),
-                        Binary::Ge => u64::from(a >= b),
-                    }
-                }
-                Operation::Mux { condition, yes, no } => {
-                    values[if values[condition.0] != 0 {
-                        yes.0
-                    } else {
-                        no.0
-                    }]
-                }
-                Operation::Slice { value, offset } => values[value.0] >> offset,
-                Operation::Concat(a, b) => (values[a.0] << self.nodes[b.0].width) | values[b.0],
-                Operation::Shift {
-                    value,
-                    amount,
-                    left,
-                } => if left {
-                    values[value.0].checked_shl(amount)
-                } else {
-                    values[value.0].checked_shr(amount)
-                }
-                .unwrap_or(0),
+                ref operation => compute(operation, |id| values[id.0], |id| self.nodes[id.0].width),
             };
             values.push(value & mask(node.width));
         }
@@ -344,6 +299,26 @@ impl Logic {
             )
             .collect();
         let mut text = format!("module {module}(\n    {}\n);\n", ports.join(",\n    "));
+        // Name the encodings of enum-typed ports.
+        if let Some((input, output)) = &self.schemas {
+            for (prefix, schema, ports) in
+                [("i", input, &self.inputs), ("o", output, &self.outputs)]
+            {
+                for ((_, leaf), port) in schema.leaves().iter().zip(ports) {
+                    if let Schema::Enum { name, variants, .. } = leaf {
+                        let variants: Vec<_> =
+                            variants.iter().map(|(v, d)| format!("{v} = {d}")).collect();
+                        writeln!(
+                            text,
+                            "// {prefix}_{}: {name} {{ {} }}",
+                            port.name,
+                            variants.join(", ")
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+        }
         for (index, node) in self.nodes.iter().enumerate() {
             let expr = match node.operation {
                 Operation::Input(p) => format!("i_{}", self.inputs[p].name),
@@ -393,6 +368,67 @@ impl Logic {
     }
 }
 
+/// The value of a non-input operation from its operands' values (unmasked).
+fn compute(
+    operation: &Operation,
+    value: impl Fn(NodeId) -> u64,
+    width: impl Fn(NodeId) -> u8,
+) -> u64 {
+    match *operation {
+        Operation::Input(_) => unreachable!("inputs have no operands"),
+        Operation::Constant(value) => value,
+        Operation::Not(a) => !value(a),
+        Operation::Binary(op, a, b) => {
+            let (a, b) = (value(a), value(b));
+            match op {
+                Binary::And => a & b,
+                Binary::Or => a | b,
+                Binary::Xor => a ^ b,
+                Binary::Add => a.wrapping_add(b),
+                Binary::Sub => a.wrapping_sub(b),
+                Binary::Eq => u64::from(a == b),
+                Binary::Ne => u64::from(a != b),
+                Binary::Lt => u64::from(a < b),
+                Binary::Le => u64::from(a <= b),
+                Binary::Gt => u64::from(a > b),
+                Binary::Ge => u64::from(a >= b),
+            }
+        }
+        Operation::Mux { condition, yes, no } => {
+            if value(condition) != 0 {
+                value(yes)
+            } else {
+                value(no)
+            }
+        }
+        Operation::Slice { value: a, offset } => value(a) >> offset,
+        Operation::Concat(a, b) => (value(a) << width(b)) | value(b),
+        Operation::Shift {
+            value: a,
+            amount,
+            left,
+        } => if left {
+            value(a).checked_shl(amount)
+        } else {
+            value(a).checked_shr(amount)
+        }
+        .unwrap_or(0),
+    }
+}
+
+fn operands(operation: &Operation) -> Vec<NodeId> {
+    match *operation {
+        Operation::Input(_) | Operation::Constant(_) => vec![],
+        Operation::Not(a)
+        | Operation::Slice { value: a, .. }
+        | Operation::Shift { value: a, .. } => {
+            vec![a]
+        }
+        Operation::Binary(_, a, b) | Operation::Concat(a, b) => vec![a, b],
+        Operation::Mux { condition, yes, no } => vec![condition, yes, no],
+    }
+}
+
 fn identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -413,6 +449,25 @@ impl Builder {
         if !(1..=64).contains(&width) {
             return fail("bit widths must be in 1..=64");
         }
+        // Constant folding: an operation on constants is a constant, and a
+        // mux with a constant condition is the selected operand.
+        if let Operation::Mux { condition, yes, no } = operation
+            && let Some(c) = self.constant_value(condition)
+        {
+            return Ok(if c != 0 { yes } else { no });
+        }
+        let sources = operands(&operation);
+        if !sources.is_empty() && sources.iter().all(|&id| self.constant_value(id).is_some()) {
+            let value = compute(
+                &operation,
+                |id| self.constant_value(id).unwrap_or(0),
+                |id| self.nodes[id.0].width,
+            );
+            return self.push_node(width, Operation::Constant(value & mask(width)));
+        }
+        self.push_node(width, operation)
+    }
+    fn push_node(&mut self, width: u8, operation: Operation) -> Result<NodeId, Error> {
         if self.nodes.len() >= 65_536 {
             return fail("logic exceeds 65536 expression nodes");
         }
@@ -443,6 +498,13 @@ impl Builder {
             return fail("bit widths must be in 1..=64");
         }
         self.push(width, Operation::Constant(value & mask(width)))
+    }
+    /// The value of `id` if it is a constant node.
+    pub fn constant_value(&self, id: NodeId) -> Option<u64> {
+        match self.nodes.get(id.0)?.operation {
+            Operation::Constant(value) => Some(value),
+            _ => None,
+        }
     }
     pub fn not(&mut self, a: NodeId) -> Result<NodeId, Error> {
         self.push(self.width(a)?, Operation::Not(a))

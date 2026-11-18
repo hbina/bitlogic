@@ -39,8 +39,9 @@ adapters through ordinary Rust trait resolution. No global registry is used.
 
 ## Values and complete results
 
-Leaves are `bool` and unsigned `Bits<N>`, widths 1 through 64. Named non-generic
-structs derive `LogicValue` and may nest other derived structs. Deriving `Copy`
+Leaves are `bool`, unsigned `Bits<N>` (widths 1 through 64) and fieldless
+enums. Named non-generic structs derive `LogicValue` and may nest other derived
+structs and fixed-length arrays `[T; N]` of any value type. Deriving `Copy`
 and `Clone` is useful for native expression reuse. Leaf and struct values can be
 inputs or outputs; the input and output types need not be the same. A circuit (a
 function with `ir()`) groups multiple logical inputs into one struct; helpers
@@ -66,6 +67,43 @@ complete next-state struct. The surrounding HDL module owns registers, reset,
 clock domains, synchronization, validity and pads. Calling the function twice
 composes transformations; it does not introduce two hardware cycles.
 
+## Arrays
+
+`[T; N]` is a value of N elements, flattened element by element (ports are
+named `field_0_...`, or `root_0` for a whole-array input or output).
+
+- `t[2]` selects with an integer literal and builds no logic.
+- `t.at(i)` selects with a run-time `Bits<K>` index through a binary mux tree
+  on the low index bits. Indexes at or past N read the zero value
+  (`LogicValue::zeroed`: all bits clear, enums at their first variant), so
+  reads are total. A `set` or `at` whose index is a constant (for example a
+  `fold` index) selects directly with no muxes.
+- `t.set(i, v)` returns a copy with element `i` replaced; out-of-range writes
+  change nothing. Hardware compares `i` with each reachable element index.
+- `[a, b, c]` and `[v; N]` (literal N) build arrays.
+- `==` and `!=` compare whole arrays and structs leaf by leaf.
+
+`at` and `set` are the `LogicArray` trait's methods, so the native function
+behaves identically; `#[logic]` imports the trait into the function body.
+
+## Enums
+
+`#[derive(LogicValue)]` on a fieldless enum stores the discriminant in the
+fewest bits that hold the largest one. Discriminants are implicit (previous
+plus one) or integer literals. The first variant is the zero value, so put the
+reset state first when a register resets to zero. Enums support only
+comparisons; arithmetic and bit methods are type errors. Enum variants and
+`const` items of any `LogicValue` type are constants in logic bodies.
+Generated Verilog names each enum port's encoding in a comment.
+
+`match` works on a scalar (enum, `Bits` or `bool`) with constant patterns:
+`Enum::Variant` paths, `const` names, `true`/`false`, `|` alternatives and `_`.
+Arms are tried in source order, as in Rust; rustc's exhaustiveness check on the
+native function lets the last arm act as the default. Guards, bindings and
+destructuring are unsupported. Constant expressions are folded while the graph
+is built: an operation on constants is a constant, and a mux with a constant
+condition is the selected value.
+
 ## Supported Rust subset
 
 - Ordinary non-generic functions with named owned inputs and an explicit owned
@@ -82,7 +120,11 @@ composes transformations; it does not introduce two hardware cycles.
   shadowing, nested value blocks and a trailing expression.
 - Named field access and complete named struct construction, including qualified
   type paths and shorthand fields.
-- `if`/`else if`/`else` expressions, including whole-struct selection.
+- `if`/`else if`/`else` expressions, including whole-struct selection, and
+  `match` as described under [Enums](#enums).
+- Arrays, literal and run-time indexing, `set`, array literals and repeats as
+  described under [Arrays](#arrays).
+- Paths to enum variants and `const` items, as constants.
 - Bitwise `&`, `|`, `^`, `!`; `+`, `-`; `==`, `!=`, `<`, `<=`, `>`, `>=`.
 - Boolean `&&`, `||`; expressions in this subset have no side effects.
 - Literal `<<`/`>>` counts, boolean literals, `bits::<N>(integer literal)`.
@@ -91,9 +133,11 @@ composes transformations; it does not introduce two hardware cycles.
 - Explicit bounded immutable folds as described below.
 
 Mutation, references, assignment statements, compound assignments, early returns,
-struct-update syntax, destructuring, tuples/arrays/enums, calls to non-`#[logic]` functions,
+struct-update syntax, destructuring, tuples, enums with fields, match guards,
+run-time `[]` indexing, calls to non-`#[logic]` functions,
 ordinary loops, async/unsafe functions, and arbitrary leaf types are unsupported.
-`LogicValue` derives require nonempty named non-generic structs. Rust names are
+`LogicValue` derives require nonempty named non-generic structs or nonempty
+fieldless enums. Rust names are
 resolved normally for schemas; recognized DSL operations such as `bits` are
 syntactic and must use the supplied definitions rather than shadowed substitutes.
 Some errors (including dynamic schema validation, flattening name collisions and

@@ -11,7 +11,7 @@ cargo test --workspace --locked
 make emit example
 ```
 
-The active workspace has forty-two tests and eleven doctests (ten compile-fail).
+The active workspace has 54 tests and 17 doctests (14 compile-fail).
 
 The 2026-11-08 audit also reran the 16 historical processor CLI commands,
 the generic mapped and routed processor regressions, Ruff and the physical
@@ -161,11 +161,12 @@ accumulators. Invalid bit/slice/concat bounds fail during capture.
 A macro unit test checks mutation/reference/assignment rejection, invalid
 signatures, missing else/early returns, iteration/work limits and validation of
 zero-iteration fold bodies, duplicate parameters and generic/non-path calls.
-Eleven compile-fail doctests cover mutation, references, missing fields,
+Fourteen compile-fail doctests cover mutation, references, missing fields,
 incompatible branches, unsupported leaf types, `ir()` on a multi-input helper,
-calls to ordinary Rust functions, reassignment, early return, struct updates and
-tuple structs. Two executable doctests check pure structured native/IR evaluation
-and HDL construction, and helper calls over all 256 bytes.
+calls to ordinary Rust functions, reassignment, early return, struct updates,
+tuple structs, run-time `[]` indexing, match guards and enums with fields.
+Three executable doctests check pure structured native/IR evaluation and HDL
+construction, helper calls over all 256 bytes, and an array/enum register file.
 
 ## Calls between logic functions (2026-11-18)
 
@@ -176,6 +177,37 @@ oracle (`format!("{:02X}")`, `count_ones`, wrapping addition) in native Rust,
 the IR and Icarus-simulated HDL. It also checks that inlining adds no ports,
 that a single-input helper still has its own `ir()`, and that a recursive call
 terminates natively but fails during capture with a depth error.
+
+## Arrays, enums and constant folding (2026-11-18)
+
+`tests/arrays.rs` checks a request/response function over a five-entry table
+(not a power of two) of `{valid, key, value}` structs: run-time reads with a
+4-bit index (every value, including the out-of-range 5..=15), a 1-bit index
+that reaches only two entries, `set` with a 2-bit index, a fold-based lookup,
+aggregate `==`/`!=`, array literals, repeats and literal indexes. 2,000 random
+requests match an oracle written with integer tuples and `Vec` in native Rust,
+the IR and Icarus-simulated HDL. Further tests check that constant indexes and
+constant writes (directly and inside a fold) build no muxes, that ports are
+named by index, and that a 64-bit index far past the end reads zero.
+
+`tests/enums.rs` runs every one of the 768 states of a machine with an
+implicit-discriminant enum, a sparse explicit-discriminant enum (4 bits wide,
+zero value `Low`), a `[bool; 2]` field, nested `match` on enums, `Bits` consts
+and `bool`, alternatives and `_`, against an integer oracle in native Rust, the
+IR and Icarus. It also checks encodings, widths, invalid-discriminant
+rejection, nominal identity of look-alike enums, first-match-wins on
+overlapping/unreachable arms, and the enum comments in emitted Verilog.
+
+Mutations of the run-time read (padding, range check, tree order), `set`
+(constant and run-time paths), aggregate `!=`, enum zero values, wildcard
+handling and arm order were each applied and each made a test fail. Macro unit
+tests and three compile-fail doctests cover rejected forms (run-time `[]`,
+guards, enums with fields, bindings in patterns, duplicate discriminants).
+Constant folding changes generated netlists, not behavior: the full workspace
+suite, including the 25 processor tests, passes with it, and
+`scripts/processor_migration_equiv.sh` (Yosys 0.70 `equiv_simple`) proves the
+folded processor next-state HDL equivalent to the pre-migration baseline
+(122 of 122 `$equiv` cells proven).
 
 The [migration audit](pure_functions.md) records baseline and current evidence.
 The integer processor reference and protocol oracle logic are preserved.

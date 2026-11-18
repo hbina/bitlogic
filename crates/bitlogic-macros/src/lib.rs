@@ -32,8 +32,14 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
             "LogicValue requires a non-generic named struct",
         ));
     }
+    if let syn::Data::Enum(data) = &input.data {
+        return derive_enum(&input.ident, data);
+    }
     let syn::Data::Struct(data) = &input.data else {
-        return Err(error(input, "LogicValue requires a named struct"));
+        return Err(error(
+            input,
+            "LogicValue requires a named struct or fieldless enum",
+        ));
     };
     let syn::Fields::Named(fields) = &data.fields else {
         return Err(error(input, "LogicValue requires named fields"));
@@ -68,17 +74,64 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
         }
     })
 }
+/// Fieldless enums are stored as their discriminant. Discriminants are
+/// implicit (previous + 1, starting at 0) or integer literals.
+fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
+    if data.variants.is_empty() {
+        return Err(error(name, "LogicValue enums need at least one variant"));
+    }
+    let mut next = 0u64;
+    let mut idents = Vec::new();
+    let mut labels = Vec::new();
+    let mut values = Vec::new();
+    for variant in &data.variants {
+        if !matches!(variant.fields, syn::Fields::Unit) {
+            return Err(error(variant, "LogicValue enums must be fieldless"));
+        }
+        let value = match &variant.discriminant {
+            Some((_, expr)) => integer(expr)?,
+            None => next,
+        };
+        if values.contains(&value) {
+            return Err(error(variant, "duplicate enum discriminant"));
+        }
+        next = value
+            .checked_add(1)
+            .ok_or_else(|| error(variant, "enum discriminant overflow"))?;
+        idents.push(&variant.ident);
+        labels.push(clean(&variant.ident));
+        values.push(value);
+    }
+    Ok(quote! {
+        impl ::bitlogic::LogicValue for #name {
+            fn schema() -> ::bitlogic::Schema {
+                ::bitlogic::Schema::enumeration::<Self>(vec![#((#labels.into(), #values)),*])
+            }
+            fn flatten(&self) -> ::std::vec::Vec<u64> {
+                ::std::vec![match self { #(Self::#idents => #values),* }]
+            }
+            fn read(values: &mut impl ::std::iter::Iterator<Item=u64>) -> ::std::result::Result<Self,::bitlogic::Error> {
+                match values.next() {
+                    #(Some(#values) => Ok(Self::#idents),)*
+                    _ => Err(::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into())),
+                }
+            }
+        }
+    })
+}
 fn clean(name: &syn::Ident) -> String {
     name.to_string().trim_start_matches("r#").to_owned()
 }
 fn value_type(ty: &Type) -> syn::Result<()> {
-    if !matches!(ty, Type::Path(p) if p.qself.is_none()) {
-        return Err(error(
+    match ty {
+        Type::Path(p) if p.qself.is_none() => Ok(()),
+        Type::Array(a) => value_type(&a.elem),
+        Type::Paren(p) => value_type(&p.elem),
+        _ => Err(error(
             ty,
-            "logic values must be owned bool, Bits<N>, or derived structs",
-        ));
+            "logic values must be owned bool, Bits<N>, arrays, or derived structs/enums",
+        )),
     }
-    Ok(())
 }
 fn integer(expr: &Expr) -> syn::Result<u64> {
     if let Expr::Lit(lit) = expr
@@ -184,16 +237,138 @@ impl Lower {
             __logic_depth + 1,
         )?)))
     }
+    /// `match` on a scalar (enum, `Bits` or `bool`) with constant patterns:
+    /// enum variants, `const`s, `true`/`false`, `|` alternatives and `_`.
+    /// Arms are tried in order; rustc's exhaustiveness check on the native
+    /// function makes the last arm the default.
+    fn matching(&mut self, m: &syn::ExprMatch, env: &Env) -> syn::Result<Tokens> {
+        let scrutinee = self.expr(&m.expr, env)?;
+        let mut arms = Vec::new();
+        for arm in &m.arms {
+            if let Some((r#if, _)) = &arm.guard {
+                return Err(error(r#if, "match guards are not supported"));
+            }
+            let mut patterns = Vec::new();
+            let wildcard = self.patterns(&arm.pat, env, &mut patterns)?;
+            let value = self.expr(&arm.body, env)?;
+            arms.push((patterns, wildcard, value));
+            if wildcard {
+                break;
+            }
+        }
+        let Some((_, _, mut result)) = arms.pop() else {
+            return Err(error(m, "match needs at least one arm"));
+        };
+        for (patterns, _, value) in arms.into_iter().rev() {
+            let mut hit: Option<Tokens> = None;
+            for pattern in patterns {
+                let eq = self.emit(quote!(#scrutinee.binary(__logic_builder,::bitlogic::Binary::Eq,&#pattern,false)?));
+                hit = Some(match hit {
+                    None => eq,
+                    Some(h) => self
+                        .emit(quote!(#h.binary(__logic_builder,::bitlogic::Binary::Or,&#eq,true)?)),
+                });
+            }
+            let hit = hit.expect("arm has a pattern");
+            result = self.emit(
+                quote!(::bitlogic::__private::Symbolic::mux(__logic_builder,&#hit,&#value,&#result)?),
+            );
+        }
+        Ok(result)
+    }
+    /// Collect the constant values of a pattern; true for `_`.
+    fn patterns(&mut self, pat: &Pat, env: &Env, out: &mut Vec<Tokens>) -> syn::Result<bool> {
+        self.tick(pat)?;
+        match pat {
+            Pat::Wild(_) => Ok(true),
+            Pat::Or(or) => {
+                let mut wildcard = false;
+                for case in &or.cases {
+                    wildcard |= self.patterns(case, env, out)?;
+                }
+                Ok(wildcard)
+            }
+            Pat::Paren(p) => self.patterns(&p.pat, env, out),
+            Pat::Path(p) if p.qself.is_none() => {
+                out.push(
+                    self.emit(
+                        quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #p)?),
+                    ),
+                );
+                Ok(false)
+            }
+            Pat::Lit(lit) if matches!(lit.lit, syn::Lit::Bool(_)) => {
+                out.push(self.emit(
+                    quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #lit)?),
+                ));
+                Ok(false)
+            }
+            // A bare name is a `const` (or an imported variant); a binding
+            // would be a fresh variable, which the language does not support.
+            Pat::Ident(p)
+                if p.by_ref.is_none()
+                    && p.mutability.is_none()
+                    && p.subpat.is_none()
+                    && !env.contains_key(&clean(&p.ident)) =>
+            {
+                let ident = &p.ident;
+                out.push(self.emit(
+                    quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #ident)?),
+                ));
+                Ok(false)
+            }
+            _ => Err(error(
+                pat,
+                "match patterns must be enum variants, consts, true/false, | alternatives or _",
+            )),
+        }
+    }
     fn expr(&mut self, expr: &Expr, env: &Env) -> syn::Result<Tokens> {
         self.tick(expr)?;
         match expr {
             Expr::Paren(p) => self.expr(&p.expr, env),
             Expr::Group(g) => self.expr(&g.expr, env),
             Expr::Block(b) if b.label.is_none() => self.block(&b.block, env),
-            Expr::Path(p) if p.path.get_ident().is_some() => env
-                .get(&clean(p.path.get_ident().unwrap()))
-                .cloned()
-                .ok_or_else(|| error(p, "unknown logic binding")),
+            Expr::Path(p) if p.qself.is_none() => {
+                if let Some(ident) = p.path.get_ident()
+                    && let Some(value) = env.get(&clean(ident))
+                {
+                    return Ok(value.clone());
+                }
+                // Anything else (an enum variant, a `const`) is a native
+                // constant of some LogicValue type.
+                Ok(self
+                    .emit(quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #p)?)))
+            }
+            Expr::Index(index) => {
+                let base = self.expr(&index.expr, env)?;
+                let Ok(i) = integer(&index.index) else {
+                    return Err(error(
+                        index,
+                        "index arrays with an integer literal, or use .at(index) for a run-time index",
+                    ));
+                };
+                let i =
+                    usize::try_from(i).map_err(|_| error(index, "array index out of bounds"))?;
+                Ok(self.emit(quote!(#base.element(#i)?)))
+            }
+            Expr::Array(array) => {
+                let mut elements = Vec::new();
+                for element in &array.elems {
+                    let value = self.expr(element, env)?;
+                    elements.push(quote!(#value.clone()));
+                }
+                Ok(self.emit(quote!(::bitlogic::__private::Symbolic::array(
+                    ::std::vec![#(#elements),*]
+                )?)))
+            }
+            Expr::Repeat(repeat) => {
+                let value = self.expr(&repeat.expr, env)?;
+                let len = usize::try_from(integer(&repeat.len)?)
+                    .map_err(|_| error(repeat, "array length too large"))?;
+                Ok(self.emit(quote!(#value.repeat(#len)?)))
+            }
+            Expr::Match(m) => self.matching(m, env),
             Expr::Field(f) => {
                 let base = self.expr(&f.base, env)?;
                 let syn::Member::Named(field) = &f.member else {
@@ -358,6 +533,15 @@ impl Lower {
                             .map_err(|_| error(call, "slice out of bounds"))?;
                         Ok(self.emit(quote!(#a.slice(__logic_builder,#offset,#width,#bit)?)))
                     }
+                    "at" if call.args.len() == 1 && generic.is_empty() => {
+                        let i = self.expr(&call.args[0], env)?;
+                        Ok(self.emit(quote!(#a.at(__logic_builder,&#i)?)))
+                    }
+                    "set" if call.args.len() == 2 && generic.is_empty() => {
+                        let i = self.expr(&call.args[0], env)?;
+                        let v = self.expr(&call.args[1], env)?;
+                        Ok(self.emit(quote!(#a.set(__logic_builder,&#i,&#v)?)))
+                    }
                     "concat" if call.args.len() == 1 && generic.len() == 2 => {
                         let b = self.expr(&call.args[0], env)?;
                         let low = u8::try_from(generic[0])
@@ -368,7 +552,7 @@ impl Lower {
                     }
                     _ => Err(error(
                         call,
-                        "supported methods: bit, slice, concat, bounded fold",
+                        "supported methods: bit, slice, concat, at, set, bounded fold",
                     )),
                 }
             }
@@ -430,6 +614,15 @@ fn expand(function: ItemFn) -> syn::Result<Tokens> {
         inputs.push((name, ty));
     }
     let result = lower.block(&function.block, &env)?;
+    // Native bodies get `at`/`set` on arrays without an explicit import.
+    let mut function = function.clone();
+    function.block.stmts.insert(
+        0,
+        syn::parse_quote!(
+            #[allow(unused_imports)]
+            use ::bitlogic::LogicArray as _;
+        ),
+    );
     let statements = lower.statements;
     let arity = inputs.len();
     let name = &sig.ident;
@@ -509,8 +702,34 @@ mod tests {
                 "65536 lowering",
             ),
             ("fn f(a:bool)->bool {loop {}}", "unsupported"),
+            ("fn f(a:[bool;2])->bool {a[a[0]]}", "literal"),
+            (
+                "fn f(a:bool)->bool {match a { true if a => a, _ => a }}",
+                "guards",
+            ),
+            (
+                "fn f(a:bool)->bool {match a { x @ true => a, _ => a }}",
+                "patterns",
+            ),
+            ("fn f(a:bool)->bool {match a { a => a }}", "patterns"),
+            ("fn f(a:bool)->[bool;2] {[a; N]}", "integer literal"),
+            ("fn f(a:&[bool;2])->bool {a[0]}", "owned"),
         ] {
             let err = expand(syn::parse_str(source).unwrap()).unwrap_err();
+            assert!(err.to_string().contains(message), "{source}: {err}");
+        }
+    }
+    #[test]
+    fn rejects_unsupported_enums() {
+        for (source, message) in [
+            ("enum E { A(bool) }", "fieldless"),
+            ("enum E { A { x: bool } }", "fieldless"),
+            ("enum E {}", "at least one variant"),
+            ("enum E { A = 1, B = 1 }", "duplicate"),
+            ("enum E { A = 1, B = 0, C }", "duplicate"),
+            ("enum E { A = X }", "integer literal"),
+        ] {
+            let err = derive_value(syn::parse_str(source).unwrap()).unwrap_err();
             assert!(err.to_string().contains(message), "{source}: {err}");
         }
     }
