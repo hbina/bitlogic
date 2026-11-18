@@ -1,4 +1,6 @@
 //! Pure structured Rust functions lowered to combinational expression graphs.
+mod collections;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Tokens;
 use quote::{format_ident, quote};
@@ -19,6 +21,19 @@ pub fn logic(attribute: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     }
     report(syn::parse::<ItemFn>(item).and_then(expand))
+}
+
+/// `fixed_set!(pub mod name: Key, capacity = N)` generates a module with a
+/// fixed-capacity `Set` and its `#[logic]` operations.
+#[proc_macro]
+pub fn fixed_set(item: TokenStream) -> TokenStream {
+    report(syn::parse::<collections::Spec>(item).and_then(|s| collections::expand(s, false)))
+}
+/// `fixed_map!(pub mod name: Key => Value, capacity = N)` generates a module
+/// with a fixed-capacity `Map` and its `#[logic]` operations.
+#[proc_macro]
+pub fn fixed_map(item: TokenStream) -> TokenStream {
+    report(syn::parse::<collections::Spec>(item).and_then(|s| collections::expand(s, true)))
 }
 
 #[proc_macro_derive(LogicValue)]

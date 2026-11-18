@@ -104,6 +104,46 @@ destructuring are unsupported. Constant expressions are folded while the graph
 is built: an operation on constants is a constant, and a mux with a constant
 condition is the selected value.
 
+## Fixed-capacity sets and maps
+
+`fixed_set!` and `fixed_map!` generate a module with concrete types and
+`#[logic]` operations for one key type, value type and capacity, so each
+container is declared in one line instead of written by hand:
+
+```rust
+bitlogic::fixed_set!(pub mod flows: Bits<43>, capacity = 16);
+bitlogic::fixed_map!(pub mod peers: Bits<32> => Bits<48>, capacity = 16);
+
+let s = flows::insert(state.flows, enable, key);
+let hit = peers::get(state.peers, ip); // hit.hit, hit.value
+```
+
+The module contains `Entry {valid, key[, value]}`, `Set` or `Map`
+`{entries: [Entry; N], next}`, `Found {hit, index}` and, for maps,
+`Lookup {hit, value}`, plus `CAPACITY`, `Key`, `Value`, `Index` and `Count`
+(`Bits` just wide enough for a slot index and for `N`). Keys may be any
+`LogicValue`, including structs; they are compared leaf by leaf. Paths in the
+key and value types resolve from inside the generated module, which imports
+`super::*`, so use names in scope or `crate::` paths. The zero value is empty.
+
+| Operation | Behavior |
+|---|---|
+| `find(m, key) -> Found` | first slot holding `key` |
+| `contains(m, key) -> bool` | `find(m, key).hit` |
+| `get(m, key) -> Lookup` | value for `key` (maps; `value` is meaningful only when `hit`) |
+| `insert(m, enable, key[, value]) -> M` | add `key`; maps also overwrite a present key's value |
+| `update(m, enable, key, value) -> M` | overwrite a present key only (maps) |
+| `remove(m, enable, key) -> M` | vacate `key`'s slot |
+| `count(m) -> Count` | occupied slots |
+| `store(m, found, [refresh,] add, key[, value]) -> M` | write given an earlier `find`, so callers share one lookup and choose refresh/add policy |
+
+A new key fills the first vacant slot; when none is vacant the slot at `next`
+is replaced and `next` advances (wrapping at `N`). Without removals that
+replaces the oldest addition first. All operations are combinational: a lookup
+costs one key comparator per slot plus a priority chain, and an update costs a
+compare-and-mux per slot, so the cost grows linearly with capacity. Capacity
+is 1 to 256.
+
 ## Supported Rust subset
 
 - Ordinary non-generic functions with named owned inputs and an explicit owned

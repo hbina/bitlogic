@@ -72,6 +72,38 @@
 //! # Ok::<(), bitlogic::Error>(())
 //! ```
 //!
+//! `fixed_set!` and `fixed_map!` generate a module holding a fixed-capacity
+//! container and its `#[logic]` operations (`find`, `contains`, `insert`,
+//! `remove`, `count`, `store`, and for maps `get` and `update`). Lookups
+//! compare every slot in parallel; a full container replaces round-robin.
+//! ```
+//! use bitlogic::{bits, fixed_map, fixed_set, Bits, LogicValue};
+//! fixed_set!(mod flows: Bits<43>, capacity = 16);
+//! fixed_map!(mod arp: Bits<32> => Bits<48>, capacity = 8);
+//! let s = flows::insert(flows::Set::zeroed(), true, bits(0x7ff_0000_0001));
+//! assert!(flows::contains(s, bits(0x7ff_0000_0001)));
+//! assert_eq!(flows::count(s).get(), 1);
+//! let m = arp::insert(arp::Map::zeroed(), true, bits(0x0a00_0001), bits(0x0200_0000_0001));
+//! assert_eq!(arp::get(m, bits(0x0a00_0001)).value.get(), 0x0200_0000_0001);
+//! assert!(!arp::get(arp::remove(m, true, bits(0x0a00_0001)), bits(0x0a00_0001)).hit);
+//! # Ok::<(), bitlogic::Error>(())
+//! ```
+//!
+//! A set has no value type:
+//! ```compile_fail
+//! bitlogic::fixed_set!(mod s: bitlogic::Bits<8> => bool, capacity = 4);
+//! ```
+//!
+//! A map needs one:
+//! ```compile_fail
+//! bitlogic::fixed_map!(mod m: bitlogic::Bits<8>, capacity = 4);
+//! ```
+//!
+//! Capacity is 1 to 256 (the fold limit):
+//! ```compile_fail
+//! bitlogic::fixed_set!(mod s: bitlogic::Bits<8>, capacity = 0);
+//! ```
+//!
 //! A run-time index needs `at`, not `[]`:
 //! ```compile_fail
 //! use bitlogic::{logic, Bits};
@@ -175,7 +207,7 @@
 
 mod ir;
 mod value;
-pub use bitlogic_macros::{LogicValue, logic};
+pub use bitlogic_macros::{LogicValue, fixed_map, fixed_set, logic};
 pub use value::{LogicArray, LogicValue, Schema};
 #[doc(hidden)]
 pub mod __private {

@@ -11,7 +11,7 @@ cargo test --workspace --locked
 make emit example
 ```
 
-The active workspace has 54 tests and 17 doctests (14 compile-fail).
+The active workspace has 58 tests and 21 doctests (17 compile-fail).
 
 The 2026-11-08 audit also reran the 16 historical processor CLI commands,
 the generic mapped and routed processor regressions, Ruff and the physical
@@ -211,6 +211,25 @@ folded processor next-state HDL equivalent to the pre-migration baseline
 
 The [migration audit](pure_functions.md) records baseline and current evidence.
 The integer processor reference and protocol oracle logic are preserved.
+
+## Fixed-capacity sets and maps (2026-11-18)
+
+`tests/collections.rs` drives a `fixed_set!` of 43-bit keys with 5 slots (not
+a power of two, so `next` wraps by comparison) and a `fixed_map!` keyed by a
+two-field struct with 4 slots, each through 3,000 random insert/remove/update
+steps with eight or seven distinct keys, so containers fill, replace and
+vacate. After every step the slot contents, `next`, membership, `get` and
+`count` match an independent model (a `Vec<Option<_>>` with first-vacant
+insertion and round-robin replacement) in native Rust and the IR; every fifth
+step is also replayed in Icarus. A third test checks index and count widths at
+capacities 1, 4, 5 and 256 and round-robin replacement in a full 256-slot set.
+Nine mutations of the generated code (vacant-slot preference, replacement
+advance, removal, count, wrap, `update` adding, map refresh, `find` ignoring
+`valid`, last-match priority) were each applied and each made a test fail;
+last-match priority is unobservable through the operations (a key is stored
+once), so a hand-built state with a duplicate key checks first-match `find`.
+Three compile-fail doctests reject a set with a value type, a map without
+one, and capacity 0.
 
 ## Build and CI
 
