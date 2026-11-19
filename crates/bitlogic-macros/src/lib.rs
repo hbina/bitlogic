@@ -644,7 +644,20 @@ fn expand(function: ItemFn) -> syn::Result<Tokens> {
     let vis = &function.vis;
     // Only single-input functions are complete circuits with an input schema;
     // other arities are helpers that callers inline.
+    let mut call = quote!();
     let ir = if let [(root, input)] = inputs.as_slice() {
+        call = quote! {
+            impl ::bitlogic::LogicFn for #name {
+                type Input = #input;
+                type Output = #output;
+                fn call(input: #input) -> #output {
+                    #name(input)
+                }
+                fn graph() -> ::std::result::Result<::bitlogic::Logic,::bitlogic::Error> {
+                    Self::ir()
+                }
+            }
+        };
         quote! {
             pub fn ir() -> ::std::result::Result<::bitlogic::Logic,::bitlogic::Error> {
                 let mut __logic_builder = ::bitlogic::Builder::default();
@@ -661,6 +674,7 @@ fn expand(function: ItemFn) -> syn::Result<Tokens> {
         #function
         #[allow(non_camel_case_types)]
         #vis struct #name {}
+        #call
         impl #name {
             #ir
             /// Build this function's graph into `__logic_builder` from

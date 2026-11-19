@@ -206,8 +206,10 @@
 //! ```
 
 mod ir;
+pub mod system;
 mod value;
 pub use bitlogic_macros::{LogicValue, fixed_map, fixed_set, logic};
+pub use system::{Evaluate, Interpreted, LogicFn, Memory, Native};
 pub use value::{LogicArray, LogicValue, Schema};
 #[doc(hidden)]
 pub mod __private {

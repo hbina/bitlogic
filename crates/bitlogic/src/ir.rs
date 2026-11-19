@@ -429,7 +429,7 @@ fn operands(operation: &Operation) -> Vec<NodeId> {
     }
 }
 
-fn identifier(name: &str) -> bool {
+pub(crate) fn identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars
         .next()
