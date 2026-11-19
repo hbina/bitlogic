@@ -1,5 +1,6 @@
 //! Pure structured Rust functions lowered to combinational expression graphs.
 mod collections;
+mod system;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as Tokens;
@@ -34,6 +35,13 @@ pub fn fixed_set(item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn fixed_map(item: TokenStream) -> TokenStream {
     report(syn::parse::<collections::Spec>(item).and_then(|s| collections::expand(s, true)))
+}
+
+/// `system!(pub mod name { ... })` declares units, memories and boundary
+/// registers once and generates a cycle model and Verilog for them.
+#[proc_macro]
+pub fn system(item: TokenStream) -> TokenStream {
+    report(syn::parse::<system::Spec>(item).and_then(system::expand))
 }
 
 #[proc_macro_derive(LogicValue)]

@@ -89,6 +89,53 @@
 //! # Ok::<(), bitlogic::Error>(())
 //! ```
 //!
+//! `system!` composes single-input step functions into a clocked system.
+//! Each unit's input and output structs have a `state` field, held in a
+//! register. Unit inputs connect only to registered values (params, inputs,
+//! `unit.state.field`, `memory.rdata`); a unit's other outputs drive memory
+//! ports and registered outputs. One declaration generates a cycle model
+//! (`Core`) and the Verilog (`verilog()`).
+//! ```
+//! use bitlogic::{bits, logic, Bits, LogicValue, Native};
+//! #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]
+//! pub struct Count { n: Bits<4> }
+//! #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]
+//! pub struct CountIn { state: Count, enable: bool, seen: Bits<4> }
+//! #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]
+//! pub struct CountOut { state: Count, we: bool, addr: Bits<4> }
+//! #[logic]
+//! fn count(i: CountIn) -> CountOut {
+//!     let n = i.state.n;
+//!     CountOut {
+//!         state: Count { n: if i.enable { n + bits::<4>(1) } else { n } },
+//!         we: i.enable,
+//!         addr: n,
+//!     }
+//! }
+//! bitlogic::system! {
+//!     mod counter {
+//!         input enable: bool;
+//!         ram log: Bits<4>, addr_bits = 4;
+//!         unit c: Count = count(CountIn { state, enable, seen: log.rdata });
+//!         write log(c.we, c.addr, c.state.n);
+//!         read log(c.addr);
+//!         output n: Bits<4> = c.state.n;
+//!     }
+//! }
+//! # fn main() -> Result<(), bitlogic::Error> {
+//! let mut core = counter::Core::new(Native);
+//! for _ in 0..3 {
+//!     core.clock(counter::Inputs { enable: true });
+//! }
+//! assert_eq!(core.outputs().n.get(), 3);
+//! assert_eq!(core.log.cells[..3], [bits(0), bits(1), bits(2)]);
+//! let files = counter::verilog()?;
+//! assert_eq!(files[0].0, "counter.v");
+//! assert!(files[0].1.contains("c_unit c_i ("));
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! A set has no value type:
 //! ```compile_fail
 //! bitlogic::fixed_set!(mod s: bitlogic::Bits<8> => bool, capacity = 4);
@@ -208,7 +255,7 @@
 mod ir;
 pub mod system;
 mod value;
-pub use bitlogic_macros::{LogicValue, fixed_map, fixed_set, logic};
+pub use bitlogic_macros::{LogicValue, fixed_map, fixed_set, logic, system};
 pub use system::{Evaluate, Interpreted, LogicFn, Memory, Native};
 pub use value::{LogicArray, LogicValue, Schema};
 #[doc(hidden)]

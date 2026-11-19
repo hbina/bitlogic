@@ -231,6 +231,41 @@ once), so a hand-built state with a duplicate key checks first-match `find`.
 Three compile-fail doctests reject a set with a value type, a map without
 one, and capacity 0.
 
+## Clocked systems (2026-11-19)
+
+`tests/system.rs` declares a producer and a consumer joined through a 16-entry
+RAM, plus an 8-entry ROM, a struct param, a registered and an unregistered
+input, and outputs from registered state, a registered unit output, a
+registered input, a param and RAM read data. Over 3,000 cycles of bursty random
+input with two reset edges every 1,000 cycles, the generated cycle model
+matches an independent integer model (written directly, not from the
+declaration) and the IR-evaluated model on every output and on unit state and
+RAM contents; the ring fills, drains, and reads an address on the same edge it
+is written (read-first). The first 1,500 cycles are replayed against the
+generated Verilog under Icarus. A third test checks that a RAM declared wider
+than its address signals is reported by `verilog()` and that param defaults
+reach the design.
+
+`bitlogic-macros` unit tests accept a declaration using every connection kind
+and reject 20 malformed ones (combinational unit outputs into units,
+unregistered outputs from units or unregistered inputs, missing, duplicate or
+ROM write ports, unknown names, non-name expressions, `..`, a missing or
+renamed `state`, reserved and duplicate names, address widths, unknown items).
+
+Nine injected bugs were each applied to the macro or backend: writing before
+reading, never updating an input register, ignoring reset in the model,
+skipping the input register or the output register in Verilog, reading a RAM
+at its write address, and not resetting an output register were caught. Not
+preloading the first ROM word or the RAM read data before the first edge
+survived: reset edges overwrite both, so neither is observable.
+
+In `arty_ethernet`, the generated core replaced a hand-written `eth_core.v`
+and Rust cycle model. Before the hand-written files were deleted, the two
+cycle models agreed on every output and every unit state over 526,184 cycles of
+random ARP, ICMP, IPv4, beacon and corrupted-FCS traffic with RX-ring overflow
+bursts, and the two Verilog cores produced identical `tx_en`, `txd`,
+`rx_active` and `tx_frame_toggle` over 63,400 cycles in Vivado xsim.
+
 ## Build and CI
 
 `make emit` writes `build/select_logic.v`; `make example` prints the HDL example.

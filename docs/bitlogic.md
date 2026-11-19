@@ -243,6 +243,62 @@ semantics. Bitlogic does not implement NetKAT packet history, union, Kleene star
 or its complete equational decision procedure. Pure state functions do not need
 a state monad: state is explicit in their input and output values.
 
+## Clocked systems
+
+`system!(pub mod name { ... })` declares how single-input step functions,
+memories and pins connect on one clock:
+
+```rust
+bitlogic::system! {
+    pub mod pipe {
+        param cfg: Cfg = Cfg { step: bits(3), enable: true };
+        input ctl: Ctl, registered;          // boundary register
+        input poke: Bits<8>;                 // straight to the units
+        ram ring: Bits<8>, addr_bits = 4;
+        rom scale: Bits<6>, addr_bits = 3, contents = SCALES.map(bits::<6>);
+        unit prod: ProdState = produce(ProdIn { state, cfg, ctl, rd: cons.state.rd });
+        unit cons: ConsState = consume(ConsIn {
+            state, wr: prod.state.wr, data: ring.rdata, scale: scale.rdata, poke,
+        });
+        write ring(prod.we, prod.waddr, prod.wdata);
+        read ring(cons.raddr);
+        read scale(cons.rom_addr);
+        output sum: Bits<16> = cons.state.sum;
+        output odd: bool = cons.odd, registered;
+    }
+}
+```
+
+A unit's input and output structs both have a `state` field of the declared
+type, held in a register that resets to zero. In a connection, `u.state.f` is
+unit `u`'s registered state, `u.f` one of its other (combinational) outputs,
+`m.rdata` a memory's registered read data, and a param or input is named
+directly, with optional `.field` paths. Unit inputs take only registered values
+(params, inputs, state, read data), so units can be evaluated in any order and
+no combinational path crosses between them. Combinational unit outputs drive
+memory ports and `registered` outputs. Memories are read-first with one cycle of
+read latency; a ROM has a read port only.
+
+The macro generates, inside module `pipe`:
+
+- `Inputs` and `Outputs` structs, one field per pin group;
+- `Core<E: Evaluate = Native>` with one public field per param, unit state,
+  boundary register and memory (`Memory { cells, rdata }`). `Core::new` takes
+  the evaluator and the params and applies two reset edges with zero inputs;
+  `clock(inputs)` and `reset(inputs)` advance one edge and return the outputs
+  after it. `Native` calls the Rust functions; `Interpreted` evaluates their
+  IR graphs;
+- `design()`, the declaration as data, and `verilog()`, the files: the core
+  module named after the system, a registered wrapper `<unit>_unit` per unit
+  (state register plus the `<unit>_unit_logic` combinational step), a
+  `<rom>_rom` per ROM and `bitlogic_sdp_ram`.
+
+In the core module, params become Verilog parameters named by their leaf path
+in upper case (`CFG_STEP`), and inputs and outputs become ports named by their
+leaf path (`ctl_go`, `sum`). The connection struct literal is pasted into the
+cycle model, so rustc checks connection types; `verilog()` checks widths and
+schemas again and rejects unconnected fields.
+
 ## HDL integration
 
 Ports use `i_`/`o_` prefixes. A nested path `state.counter` becomes `i_state_counter`

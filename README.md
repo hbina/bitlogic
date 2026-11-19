@@ -1,10 +1,12 @@
 # Bitlogic
 
-**Last updated: 2026-11-18.** An untimed Rust DSL for pure bit-vector
+**Last updated: 2026-11-19.** An untimed Rust DSL for pure bit-vector
 transformations: `F: Input -> Output`. Write immutable expressions and return a
 complete struct, capture a typed expression graph, then interpret it or emit
-combinational Verilog. The native function remains callable. Clocking, reset,
-CDC, state registers and pad integration belong in the user's top module.
+combinational Verilog. The native function remains callable. `system!`
+composes step functions, RAMs and ROMs into a one-clock system and generates
+both its cycle model and its Verilog; clock generation, CDC and pad
+integration belong in the user's top module.
 
 ```rust
 use bitlogic::{logic, bits, Bits, LogicValue};
@@ -85,7 +87,7 @@ See the [architecture](docs/protocol_processor.md),
 
 | Crate | Responsibility |
 |---|---|
-| [`bitlogic`](crates/bitlogic/src/lib.rs) | Fixed-width values, typed IR, interpretation, composition, and combinational Verilog |
+| [`bitlogic`](crates/bitlogic/src/lib.rs) | Fixed-width values, typed IR, interpretation, composition, combinational Verilog, and the [`system!`](crates/bitlogic/src/system.rs) runtime and Verilog backend |
 | [`bitlogic-macros`](crates/bitlogic-macros/src/lib.rs) | Pure expression capture and structured-value derivation |
 
 The [pure structured-function migration](docs/pure_functions.md) replaces the
@@ -100,6 +102,7 @@ outputs match the pre-migration HDL.
 |---|---|---|
 | Rust frontend | Partial | Immutable owned input/output values, nested structs, fixed-length arrays (literal and run-time `at`/`set` indexing), fieldless enums with `match`, `const` and variant paths, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, 2,000 array requests and all 768 states of an enum machine against integer oracles; documented subset |
 | Fixed-capacity sets and maps | Verified | `fixed_set!`/`fixed_map!` generate a container module (find, contains, get, insert, update, remove, count, store) for any key/value type and capacity 1..=256; 3,000-step random sequences on a 43-bit-key set (5 slots) and a struct-keyed map (4 slots) match an independent slot model in native Rust, the IR and Icarus; nine macro mutations caught; widths checked at capacities 1, 4, 5 and 256 |
+| Clocked systems (`system!`) | Verified | One declaration of params, registered/unregistered inputs, RAMs, ROMs, units and outputs generates a typed cycle model (`clock`, `reset`) and Verilog (core, unit wrappers, ROMs, RAM); `tests/system.rs`: a producer/consumer pair through a RAM plus a ROM matches an independent integer model and the IR for 3,000 cycles and Icarus for 1,500 cycles, including mid-run resets and same-address read/write collisions; 20 rejected declarations; seven injected backend/macro bugs caught, two unobservable after reset; replaces arty_ethernet's hand-written core with identical outputs (see [verification](docs/verification.md#clocked-systems-2026-11-19)) |
 | Constant folding | Verified | Operations on constants become constants and constant-condition muxes disappear while graphs are built; constant array indexes build no muxes (tests/arrays.rs); full workspace suite including 25 processor tests passes unchanged, and Yosys proves the folded processor HDL equivalent to the pre-migration baseline (122/122 cells) |
 | Bit-vector IR and composition | Verified | Independent truth tables, all eleven three-bit binary operations, composition identities, port-shape/value errors, and width boundaries in integration tests |
 | Combinational Verilog | Partial | Icarus checks 128 conditional-transform combinations and 2,725 operator/boundary cases; no synthesis or board evidence |
@@ -119,7 +122,7 @@ outputs match the pre-migration HDL.
 | Generic synthesis | Verified | Yosys 0.70: 2,165 generic logic cells + 122 flops; structural check and complete mapped processor regression pass; no technology area/timing claim |
 | SKY130 HD block implementation | Partial | Fresh migrated RTL at TT/25 °C/1.8 V: 15,713.8 µm² cell area, +10.3544 ns setup / +0.253807 ns hold slack at 20 ns; router DRC/antenna zero, constraint audit and routed regression pass; no chip signoff |
 
-`cargo test --workspace --locked`: **58 tests and 21 doctests pass** (17 compile-fail).
+`cargo test --workspace --locked`: **63 tests and 22 doctests pass** (17 compile-fail).
 `cargo fmt --all --check`, Clippy with warnings denied, and `make emit example`
 pass locally. CI runs the same Rust and HDL checks; no remote execution is claimed.
 Exact scope is in [verification](docs/verification.md).
@@ -141,6 +144,7 @@ examples export artifacts without arguments; protocol builders and execution che
 - [x] Allow `#[logic]` functions to call other `#[logic]` functions (inlined, any arity).
 - [x] Add fixed-length arrays with run-time indexing, fieldless enums with `match`, `const` paths and constant folding.
 - [x] Generate fixed-capacity sets and maps with `fixed_set!` and `fixed_map!`.
+- [x] Compose step functions, RAMs and ROMs into one-clock systems with `system!` (cycle model and Verilog from one declaration).
 - [x] Retire protocol crates and the processor backend from the active tree.
 - [x] Document the [processor and protocol implementation plan](docs/protocol_processor_plan.md) using bitlogic as a library.
 - [x] Implement a processor example with checked ISA, independent cycle model, and clocked HDL verification.
@@ -174,6 +178,15 @@ types are unsupported. Run-time array reads past the end return the zero value.
 combinational logic (cost grows linearly with capacity), and are generated per
 key/value/capacity rather than generic.
 Values wider than 64 bits are unsupported.
+`system!` has one clock and a synchronous reset to zero (each unit's state
+enums must list a zero-discriminant variant first). Memories have one write and
+one read port, read-first, one cycle of latency, a single-leaf element type and
+1..=24 address bits. Connections are names only (no constants or arithmetic);
+unit inputs take only registered values, and a unit's combinational outputs
+reach only memory ports and registered outputs. Generated module names
+(`<unit>_unit`, `<rom>_rom`, `bitlogic_sdp_ram`) are not prefixed by the system,
+so two systems in one design must not share unit or ROM names. Width mismatches
+are reported by `verilog()` rather than during Rust compilation.
 Immutable shadowing is allowed. Bounded folds have expansion/work limits.
 Arithmetic wraps at the declared width. Some schema and bit-bound errors are
 reported by `ir()` rather than during Rust compilation. Diagrams describe IR
@@ -181,7 +194,7 @@ structure and integration boundaries, not placed gates or physical routing.
 Structural dependencies are conservative, and nominal type identities are local to a Rust process.
 
 The IR is acyclic and combinational. State is explicit in input/output structs;
-registers belong in the surrounding module. Types do not establish clock-domain
+registers belong in the surrounding module or a `system!`. Types do not establish clock-domain
 safety, electrical correctness, protocol correctness or efficient hardware.
 Physical pin connections remain the top module's responsibility.
 
