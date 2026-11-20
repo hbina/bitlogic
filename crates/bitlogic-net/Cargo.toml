@@ -1,0 +1,13 @@
+[package]
+name = "bitlogic-net"
+description = "Bit-level logic network, optimization and 7-series LUT6/CARRY4 mapping for bitlogic graphs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bitlogic = { path = "../bitlogic" }
+
+[dev-dependencies]
+tempfile.workspace = true

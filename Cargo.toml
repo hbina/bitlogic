@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/bitlogic", "crates/bitlogic-macros"]
+members = ["crates/bitlogic", "crates/bitlogic-macros", "crates/bitlogic-net"]
 resolver = "2"
 
 [workspace.package]
