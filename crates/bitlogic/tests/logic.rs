@@ -1,3 +1,4 @@
+mod support;
 use bitlogic::{Binary, Bits, Builder, LogicValue, bits, logic};
 use std::{fmt::Write, process::Command};
 
@@ -315,4 +316,73 @@ fn emitted_hdl_covers_all_operators_and_64_bit_boundaries() {
     }
     write!(source,"module tb;reg [63:0] a,b;\n{declarations}\ninitial begin\n{checks}\n$display(\"OPERATORS PASS\");$finish;end endmodule\n").unwrap();
     run_hdl(source, "OPERATORS PASS");
+}
+
+/// Builder folds: slices through concatenations and slices, adjacent slices
+/// rejoined, muxes split at concatenation boundaries, undefined (don't-care)
+/// bits absorbed by muxes, and identical operations shared. The folded and
+/// unfolded forms agree on every input.
+#[test]
+fn builder_folds_slices_concats_muxes_and_shares_nodes() {
+    use bitlogic::Operation;
+    let mut b = Builder::default();
+    let x = b.input("x", 8).unwrap();
+    let y = b.input("y", 8).unwrap();
+    let c = b.input("c", 1).unwrap();
+    let both = b.concat(x, y).unwrap();
+    // Slices inside one part of a concatenation, of a slice, at full width.
+    assert_eq!(b.slice(both, 8, 8).unwrap(), x);
+    assert_eq!(b.slice(both, 0, 8).unwrap(), y);
+    assert_eq!(b.slice(both, 0, 16).unwrap(), both);
+    let low = b.slice(x, 0, 4).unwrap();
+    let high = b.slice(x, 4, 4).unwrap();
+    let inner = b.slice(low, 1, 2).unwrap();
+    assert_eq!(inner, b.slice(x, 1, 2).unwrap(), "shared slice of x");
+    // Adjacent slices of one value are that value.
+    assert_eq!(b.concat(high, low).unwrap(), x);
+    // A straddling slice is a concatenation of the parts' slices.
+    let straddle = b.slice(both, 4, 8).unwrap();
+    // Undefined bits: a mux with them is the other operand.
+    let dont_care = b.undefined(8).unwrap();
+    assert_eq!(b.mux(c, dont_care, x).unwrap(), x);
+    assert_eq!(b.mux(c, x, dont_care).unwrap(), x);
+    // A mux of {k, x} and {undef, x} splits: the high half is k, the low x.
+    let k = b.constant(8, 0x5a).unwrap();
+    let a = b.concat(k, x).unwrap();
+    let d = b.concat(dont_care, x).unwrap();
+    let folded = b.mux(c, a, d).unwrap();
+    let want = b.concat(k, x).unwrap();
+    assert_eq!(folded, want, "no mux left");
+    // A mux of {x, y} and an opaque value splits into two muxes.
+    let z = b.input("z", 16).unwrap();
+    let split = b.mux(c, both, z).unwrap();
+    b.output("split", split).unwrap();
+    b.output("folded", folded).unwrap();
+    b.output("straddle", straddle).unwrap();
+    let ir = b.finish().unwrap();
+    assert!(matches!(
+        ir.nodes()[straddle.index()].operation,
+        Operation::Concat(..)
+    ));
+    let mut rng = support::Rng(0xf01d_0004);
+    for _ in 0..500 {
+        let (x, y, c, z) = (
+            rng.next() & 0xff,
+            rng.next() & 0xff,
+            rng.next() & 1,
+            rng.next() & 0xffff,
+        );
+        let want_split = if c == 1 { x << 8 | y } else { z };
+        // The undefined bits fold to x's or k's; either way the low byte is x.
+        let out = ir.evaluate(&[x, y, c, z]).unwrap();
+        assert_eq!(out[0], want_split);
+        assert_eq!(out[1], 0x5a00 | x);
+        assert_eq!(out[2], (x & 0xf) << 4 | y >> 4);
+    }
+    let muxes = ir
+        .nodes()
+        .iter()
+        .filter(|n| matches!(n.operation, Operation::Mux { .. }))
+        .count();
+    assert_eq!(muxes, 2, "{:?}", ir.nodes());
 }

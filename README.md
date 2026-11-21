@@ -100,10 +100,10 @@ outputs match the pre-migration HDL.
 
 | Feature | Status | Evidence/scope |
 |---|---|---|
-| Rust frontend | Partial | Immutable owned input/output values, nested structs, fixed-length arrays (literal and run-time `at`/`set` indexing), fieldless enums and [enums with fields](docs/bitlogic.md#enums-with-fields) (construction and `match` with field bindings), `const` and variant paths, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, 2,000 array requests, all 768 states of an enum machine and all 592 states of a data-enum machine against integer oracles; documented subset |
+| Rust frontend | Partial | Immutable owned input/output values, nested structs, fixed-length arrays (literal and run-time `at`/`set` indexing), fieldless enums and [enums with fields](docs/bitlogic.md#enums-with-fields) (tagged-union layout: one payload as wide as the widest variant, don't-care padding, tag-aware `==`; construction and `match` with field bindings), `const` and variant paths, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, 2,000 array requests, all 768 states of an enum machine and all 592 states of a data-enum machine (inputs with random payload padding) against integer oracles, and `==` over every pair of 37 and 21 data-enum values with random padding (tests/adts.rs); documented subset |
 | Fixed-capacity sets and maps | Verified | `fixed_set!`/`fixed_map!` generate a container module (find, contains, get, insert, update, remove, count, store) for any key/value type and capacity 1..=256; 3,000-step random sequences on a 43-bit-key set (5 slots) and a struct-keyed map (4 slots) match an independent slot model in native Rust, the IR and Icarus; nine macro mutations caught; widths checked at capacities 1, 4, 5 and 256 |
 | Clocked systems (`system!`) | Verified | One declaration of params, registered/unregistered inputs, RAMs, ROMs, units and outputs generates a typed cycle model (`clock`, `reset`) and Verilog (core, unit wrappers, ROMs, RAM); `tests/system.rs`: a producer/consumer pair through a RAM plus a ROM matches an independent integer model and the IR for 3,000 cycles and Icarus for 1,500 cycles, including mid-run resets and same-address read/write collisions; 20 rejected declarations; seven injected backend/macro bugs caught, two unobservable after reset; replaces arty_ethernet's hand-written core with identical outputs (see [verification](docs/verification.md#clocked-systems-2026-11-19)) |
-| Constant folding | Verified | Operations on constants become constants, constant-condition and equal-operand muxes disappear, and `match`es over distinct constants mux only arms that differ, while graphs are built (tests/adts.rs node counts); constant array indexes build no muxes (tests/arrays.rs); full workspace suite including 25 processor tests passes unchanged, and Yosys proves the folded processor HDL equivalent to the pre-migration baseline (122/122 cells) |
+| Constant folding | Verified | Operations on constants become constants, identical operations share a node, constant-condition, equal-operand and don't-care-operand muxes disappear, muxes of concatenations split at part boundaries, slices fold through concatenations and adjacent slices rejoin, and `match`es over distinct constants mux only arms that differ, while graphs are built (tests/logic.rs fold test; tests/adts.rs node counts: rebuilding a data enum muxes only the tag, and a field shared by two variants moves with no mux); constant array indexes build no muxes (tests/arrays.rs); full workspace suite including 25 processor tests passes unchanged, and Yosys proves the folded processor HDL equivalent to the pre-migration baseline (122/122 cells) |
 | Bit-vector IR and composition | Verified | Independent truth tables, all eleven three-bit binary operations, composition identities, port-shape/value errors, and width boundaries in integration tests; values up to 4096 bits (`tests/wide.rs`: 600 random 100/200-bit cases of arithmetic, comparison, shifts, concat and slice across word boundaries match a `u128` oracle in native Rust, the IR and Icarus; a 96-bit `system!` register and parameter simulate in the cycle model and Icarus) |
 | Combinational Verilog | Partial | Icarus checks 128 conditional-transform combinations and 2,725 operator/boundary cases; no synthesis or board evidence |
 | Pure structured interfaces | Verified | Six structured integration tests, schema round trips, nominal composition laws, dependency expectations, and twenty-one compile-fail examples; complete returned values |
@@ -122,7 +122,7 @@ outputs match the pre-migration HDL.
 | Generic synthesis | Verified | Yosys 0.70: 2,165 generic logic cells + 122 flops; structural check and complete mapped processor regression pass; no technology area/timing claim |
 | SKY130 HD block implementation | Partial | Fresh migrated RTL at TT/25 °C/1.8 V: 15,713.8 µm² cell area, +10.3544 ns setup / +0.253807 ns hold slack at 20 ns; router DRC/antenna zero, constraint audit and routed regression pass; no chip signoff |
 
-`cargo test --workspace --locked`: **80 tests and 27 doctests pass** (21 compile-fail).
+`cargo test --workspace --locked`: **84 tests and 27 doctests pass** (21 compile-fail).
 `cargo fmt --all --check`, Clippy with warnings denied, and `make emit example`
 pass locally. CI runs the same Rust and HDL checks; no remote execution is claimed.
 Exact scope is in [verification](docs/verification.md).
@@ -161,6 +161,7 @@ examples export artifacts without arguments; protocol builders and execution che
 - [x] Select SKY130 HD, define block memory/IO/clock constraints, and verify a routed TT-corner implementation study.
 - [x] Replace mutable ports with pure structured functions, derived schemas, typed composition and dependency inspection.
 - [x] Add enums with fields (tag plus per-variant leaves), variant construction and `match` bindings.
+- [x] Store enums with fields as tagged unions (shared payload, don't-care padding, tag-aware `==`).
 - [ ] Extend the supported Rust subset and composition ergonomics.
 - [x] Prove migrated processor next-state HDL equivalent to the pre-migration implementation.
 - [ ] Extend formal checking to frontend semantics and add optimization passes.
@@ -171,9 +172,12 @@ examples export artifacts without arguments; protocol builders and execution che
 A circuit has one owned input and one complete output; helpers called from other
 `#[logic]` functions may take several. Values are `bool`, unsigned
 `Bits<1..=4096>`, non-generic enums (fieldless, or with fields), fixed-length arrays,
-and nested non-generic named structs deriving `LogicValue`. Enums with fields give
-every variant its own leaves (no overlapping payloads or niche filling); inactive
-fields must hold their zero values, including on HDL input ports. Their `match`
+and nested non-generic named structs deriving `LogicValue`. Enums with fields are a
+tag plus one payload as wide as the widest variant (at most 4096 bits), fields
+packed from bit 0 in declaration order (no niche filling, no reordering to align
+fields that differ in position); payload bits above the current variant are
+don't-care, so raw leaf vectors of equal values may differ (compare decoded values
+or `Schema::valid_bits`-masked leaves). Their `match`
 patterns bind fields to plain names only (no nested patterns or bindings in `|`
 alternatives), and a call is a tuple-variant constructor exactly when its last path
 segment starts with an uppercase letter. A `match` over distinct variants or

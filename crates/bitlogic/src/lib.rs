@@ -302,7 +302,7 @@ pub use system::{Evaluate, Interpreted, LogicFn, Memory, Native};
 pub use value::{LogicArray, LogicValue, Schema};
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::value::Symbolic;
+    pub use crate::value::{Packing, Symbolic};
     /// Nesting limit for inlined `#[logic]` calls; catches recursion.
     pub const MAX_CALL_DEPTH: usize = 64;
     /// The schema of the value a constructor expression builds. The closure is

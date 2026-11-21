@@ -1,7 +1,7 @@
 //! Icarus Verilog check for generated modules: apply each case's input leaf
 #![allow(dead_code)]
-//! values to the ports and compare every output port.
-use bitlogic::{BitVec, Logic};
+//! values to the ports and compare every output port's valid bits.
+use bitlogic::{BitVec, Logic, Schema};
 use std::{fmt::Write, process::Command};
 
 /// Leaf values as `u64`s, for integer oracles (each leaf at most 64 bits).
@@ -12,7 +12,42 @@ pub fn raw(values: &[BitVec]) -> Vec<u64> {
         .collect()
 }
 
-/// Cases are `(inputs, outputs)` port values, as `u64`s or `BitVec`s.
+/// `a & b`.
+pub fn and(a: &BitVec, b: &BitVec) -> BitVec {
+    let words: Vec<u64> = a
+        .words()
+        .iter()
+        .zip(b.words())
+        .map(|(x, y)| x & y)
+        .collect();
+    BitVec::from_words(&words)
+}
+
+/// `leaves` of a `schema` value with the don't-care payload bits of every
+/// data enum filled from `rng`: an equal value with a different encoding.
+pub fn with_padding(schema: &Schema, leaves: &[BitVec], rng: &mut Rng) -> Vec<BitVec> {
+    let masks = schema.valid_bits(leaves).unwrap();
+    schema
+        .leaves()
+        .iter()
+        .zip(leaves.iter().zip(&masks))
+        .map(|((_, leaf), (value, mask))| {
+            let width = leaf.width().unwrap();
+            let words: Vec<u64> = (0..usize::from(width).div_ceil(64))
+                .map(|i| {
+                    let v = value.words().get(i).copied().unwrap_or(0);
+                    let m = mask.words().get(i).copied().unwrap_or(0);
+                    v | (rng.next() & !m)
+                })
+                .collect();
+            BitVec::from_words(&words).masked(width)
+        })
+        .collect()
+}
+
+/// Cases are `(inputs, outputs)` port values, as `u64`s or `BitVec`s. With
+/// the IR's output schema, only valid bits are compared: data enum payload
+/// bits above the active variant are don't-care.
 pub fn check_hdl<A, B>(ir: &Logic, module: &str, cases: &[(Vec<A>, Vec<B>)])
 where
     A: Clone + Into<BitVec>,
@@ -58,10 +93,15 @@ where
             write!(source, "i_{}={}'h{v:x};", p.name, p.width).unwrap();
         }
         source.push_str("#1;\n");
-        for (p, v) in ir.outputs().iter().zip(outputs) {
+        let masks = match ir.schemas() {
+            Some((_, schema)) => schema.valid_bits(outputs).unwrap(),
+            None => ir.outputs().iter().map(|p| BitVec::ones(p.width)).collect(),
+        };
+        for ((p, v), m) in ir.outputs().iter().zip(outputs).zip(&masks) {
+            let v = and(v, m);
             writeln!(
                 source,
-                "if(o_{0}!=={1}'h{v:x}) begin $display(\"case {case} o_{0}=%h want {v:x}\",o_{0}); $fatal(1); end",
+                "if((o_{0}&{1}'h{m:x})!=={1}'h{v:x}) begin $display(\"case {case} o_{0}=%h want {v:x} mask {m:x}\",o_{0}); $fatal(1); end",
                 p.name, p.width
             )
             .unwrap();

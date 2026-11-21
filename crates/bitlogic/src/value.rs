@@ -24,10 +24,12 @@ pub enum Schema {
         width: u16,
         variants: Vec<(String, u64)>,
     },
-    /// An enum whose variants carry fields. Leaves are the `tag` (a
-    /// [`Schema::Enum`] of every variant), then each variant's fields in
-    /// declaration order under `<Variant>.<field>`; tuple fields are named
-    /// `0`, `1`, ... Fields of inactive variants hold their zero values.
+    /// An enum whose variants carry fields, stored as a tagged union: the
+    /// `tag` leaf (a [`Schema::Enum`] of every variant), then a `payload`
+    /// leaf of `Bits<P>`, `P` the widest variant's total width (no payload
+    /// leaf when `P == 0`). The active variant's field leaves are packed into
+    /// the payload from bit 0 upwards in declaration order; the bits above
+    /// them are don't-care. Tuple fields are named `0`, `1`, ...
     Tagged {
         identity: TypeId,
         name: &'static str,
@@ -90,23 +92,204 @@ impl Schema {
         }
     }
 
-    /// For a data enum: the variant's discriminant, the leaf offset of its
-    /// first field and its fields.
-    fn variant_fields(&self, variant: &str) -> Result<(u64, usize, &Fields), Error> {
+    /// For a data enum: the variant's index, discriminant and fields.
+    fn variant_fields(&self, variant: &str) -> Result<(usize, u64, &Fields), Error> {
         let Self::Tagged { tag, payloads, .. } = self else {
             return Err(Error("expected an enum with fields".into()));
         };
         let Self::Enum { variants, .. } = &**tag else {
             return Err(Error("malformed enum tag".into()));
         };
-        let mut offset = 1;
-        for ((name, fields), (_, value)) in payloads.iter().zip(variants) {
-            if name == variant {
-                return Ok((*value, offset, fields));
+        payloads
+            .iter()
+            .zip(variants)
+            .enumerate()
+            .find(|(_, ((name, _), _))| name == variant)
+            .map(|(index, ((_, fields), (_, value)))| (index, *value, fields))
+            .ok_or_else(|| Error(format!("unknown enum variant {variant}")))
+    }
+
+    /// The scalar leaves of a data enum variant's fields: each leaf's path
+    /// (`<field>` or `<field>.<subpath>`), bit offset in the payload and width.
+    pub fn variant_layout(&self, variant: &str) -> Result<Vec<(String, u16, u16)>, Error> {
+        let (_, _, fields) = self.variant_fields(variant)?;
+        let mut offset = 0u32;
+        let mut layout = Vec::new();
+        for (name, field) in fields {
+            for (path, leaf) in field.leaves() {
+                let width = leaf.width()?;
+                let path = if path.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}.{path}")
+                };
+                let at = u16::try_from(offset)
+                    .ok()
+                    .filter(|&at| u32::from(at) + u32::from(width) <= u32::from(MAX_WIDTH))
+                    .ok_or_else(|| Error(format!("enum payload exceeds {MAX_WIDTH} bits")))?;
+                layout.push((path, at, width));
+                offset += u32::from(width);
             }
-            offset += fields.iter().map(|(_, f)| f.leaves().len()).sum::<usize>();
         }
-        Err(Error(format!("unknown enum variant {variant}")))
+        Ok(layout)
+    }
+
+    /// The payload width of a data enum: its widest variant's width, 0 when
+    /// no variant has bits. Unchecked: a too wide payload makes an invalid
+    /// `Bits` leaf.
+    fn payload_bits(payloads: &[(String, Fields)]) -> u32 {
+        payloads
+            .iter()
+            .map(|(_, fields)| {
+                fields
+                    .iter()
+                    .flat_map(|(_, f)| f.leaves())
+                    .map(|(_, leaf)| u32::from(leaf.width().unwrap_or(MAX_WIDTH)))
+                    .sum::<u32>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A Verilog comment for each leaf: an enum's encoding, or the layout of
+    /// a data enum's payload (each variant's field leaves and their bits).
+    pub(crate) fn leaf_notes(&self) -> Vec<Option<String>> {
+        fn visit(schema: &Schema, out: &mut Vec<Option<String>>) {
+            match schema {
+                Schema::Struct { fields, .. } => {
+                    for (_, field) in fields {
+                        visit(field, out);
+                    }
+                }
+                Schema::Array { element, len } => {
+                    for _ in 0..*len {
+                        visit(element, out);
+                    }
+                }
+                Schema::Enum { name, variants, .. } => {
+                    let variants: Vec<_> =
+                        variants.iter().map(|(v, d)| format!("{v} = {d}")).collect();
+                    out.push(Some(format!("{name} {{ {} }}", variants.join(", "))));
+                }
+                Schema::Tagged {
+                    name,
+                    tag,
+                    payloads,
+                    ..
+                } => {
+                    visit(tag, out);
+                    if schema.payload_leaf().is_none() {
+                        return;
+                    }
+                    let mut variants = Vec::new();
+                    for (variant, _) in payloads {
+                        let Ok(layout) = schema.variant_layout(variant) else {
+                            continue;
+                        };
+                        let fields: Vec<_> = layout
+                            .iter()
+                            .map(|(path, at, width)| format!("{path} [{}:{at}]", at + width - 1))
+                            .collect();
+                        variants.push(if fields.is_empty() {
+                            variant.clone()
+                        } else {
+                            format!("{variant} {{ {} }}", fields.join(", "))
+                        });
+                    }
+                    out.push(Some(format!(
+                        "{name} payload {{ {} }}",
+                        variants.join(", ")
+                    )));
+                }
+                _ => out.push(None),
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
+    }
+
+    /// The width of a data enum's payload leaf, if it has one. A too wide
+    /// payload is `u16::MAX`, an invalid leaf width.
+    fn payload_leaf(&self) -> Option<u16> {
+        let Self::Tagged { payloads, .. } = self else {
+            return None;
+        };
+        let width = Self::payload_bits(payloads);
+        (width > 0).then(|| u16::try_from(width).unwrap_or(u16::MAX))
+    }
+
+    /// The leaves of a data enum value of `variant` with these field leaves
+    /// (in [`Schema::leaves`] order of the variant's fields): the tag and the
+    /// packed payload, its unused high bits zero.
+    pub fn encode_variant(&self, variant: &str, fields: &[BitVec]) -> Result<Vec<BitVec>, Error> {
+        let (index, _, _) = self.variant_fields(variant)?;
+        Packing::new(self)?.encode(index, fields)
+    }
+
+    /// The active variant of a data enum value's leaves and that variant's
+    /// field leaves, taken from the payload; payload bits above the variant
+    /// are ignored.
+    pub fn decode_variant(&self, values: &[BitVec]) -> Result<(String, Vec<BitVec>), Error> {
+        let packing = Packing::new(self)?;
+        let mut values = values.iter().cloned();
+        let (index, fields) = packing.decode(&mut values)?;
+        if values.next().is_some() {
+            return Err(Error("too many value leaves".into()));
+        }
+        Ok((packing.variants[index].0.clone(), fields))
+    }
+
+    /// For each leaf of a value of this schema, the mask of its meaningful
+    /// bits: all of them, except payload bits above the active variant of a
+    /// data enum (at any depth). Two values are equal when their leaves are
+    /// equal under these masks.
+    pub fn valid_bits(&self, leaves: &[BitVec]) -> Result<Vec<BitVec>, Error> {
+        fn visit(
+            schema: &Schema,
+            leaves: &mut std::slice::Iter<'_, BitVec>,
+            out: &mut Vec<BitVec>,
+        ) -> Result<(), Error> {
+            match schema {
+                Schema::Struct { fields, .. } => {
+                    for (_, field) in fields {
+                        visit(field, leaves, out)?;
+                    }
+                }
+                Schema::Array { element, len } => {
+                    for _ in 0..*len {
+                        visit(element, leaves, out)?;
+                    }
+                }
+                Schema::Tagged { .. } => {
+                    let packing = Packing::new(schema)?;
+                    let own: Vec<BitVec> = leaves.take(packing.leaves()).cloned().collect();
+                    let (index, fields) = packing.decode(&mut own.iter().cloned())?;
+                    let mut masks = Vec::new();
+                    let mut field_leaves = fields.iter();
+                    for (_, field) in &packing.fields[index] {
+                        visit(field, &mut field_leaves, &mut masks)?;
+                    }
+                    let mut encoded = packing.encode(index, &masks)?;
+                    encoded[0] = BitVec::ones(packing.tag_width);
+                    out.extend(encoded);
+                }
+                leaf => {
+                    leaves
+                        .next()
+                        .ok_or_else(|| Error("missing value leaf".into()))?;
+                    out.push(BitVec::ones(leaf.width()?));
+                }
+            }
+            Ok(())
+        }
+        let mut out = Vec::new();
+        let mut iter = leaves.iter();
+        visit(self, &mut iter, &mut out)?;
+        if iter.next().is_some() {
+            return Err(Error("too many value leaves".into()));
+        }
+        Ok(out)
     }
 
     pub fn leaves(&self) -> Vec<(String, Schema)> {
@@ -129,13 +312,10 @@ impl Schema {
                         visit(element, join(&path, &index.to_string()), result);
                     }
                 }
-                Schema::Tagged { tag, payloads, .. } => {
+                Schema::Tagged { tag, .. } => {
                     visit(tag, join(&path, "tag"), result);
-                    for (variant, fields) in payloads {
-                        let base = join(&path, variant);
-                        for (name, child) in fields {
-                            visit(child, join(&base, name), result);
-                        }
+                    if let Some(width) = schema.payload_leaf() {
+                        result.push((join(&path, "payload"), Schema::Bits(width)));
                     }
                 }
                 _ => result.push((path, schema.clone())),
@@ -158,17 +338,40 @@ impl Schema {
     }
 
     /// Leaf values of the zero value: all bits clear, except that enums take
-    /// their first variant.
+    /// their first variant (data enums with zero fields, packed).
     pub fn zero_values(&self) -> Vec<BitVec> {
-        self.leaves()
-            .iter()
-            .map(|(_, leaf)| match leaf {
-                Self::Enum { variants, .. } => {
-                    BitVec::from(variants.first().map_or(0, |(_, v)| *v))
+        fn visit(schema: &Schema, out: &mut Vec<BitVec>) {
+            match schema {
+                Schema::Struct { fields, .. } => {
+                    for (_, field) in fields {
+                        visit(field, out);
+                    }
                 }
-                _ => BitVec::zero(),
-            })
-            .collect()
+                Schema::Array { element, len } => {
+                    for _ in 0..*len {
+                        visit(element, out);
+                    }
+                }
+                Schema::Enum { variants, .. } => {
+                    out.push(BitVec::from(variants.first().map_or(0, |(_, v)| *v)));
+                }
+                Schema::Tagged { payloads, .. } => {
+                    let mut fields = Vec::new();
+                    for (_, field) in payloads.first().map_or(&[][..], |(_, f)| f) {
+                        visit(field, &mut fields);
+                    }
+                    match Packing::new(schema).and_then(|p| p.encode(0, &fields)) {
+                        Ok(leaves) => out.extend(leaves),
+                        // An invalid schema: zero leaves, rejected later.
+                        Err(_) => out.extend(schema.leaves().iter().map(|_| BitVec::zero())),
+                    }
+                }
+                _ => out.push(BitVec::zero()),
+            }
+        }
+        let mut out = Vec::new();
+        visit(self, &mut out);
+        out
     }
 
     /// The HDL port name of the leaf at `path` in a value named `root`.
@@ -181,6 +384,112 @@ impl Schema {
         } else {
             flat
         }
+    }
+}
+
+/// The packed layout of a data enum ([`Schema::Tagged`]), for encoding and
+/// decoding leaf values. Derived `LogicValue` impls cache one per type.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Packing {
+    name: &'static str,
+    /// Each variant's name and discriminant.
+    variants: Vec<(String, u64)>,
+    fields: Vec<Fields>,
+    /// Each variant's field leaf widths, from payload bit 0 upwards.
+    widths: Vec<Vec<u16>>,
+    tag_width: u16,
+    payload: u16,
+}
+
+impl Packing {
+    pub fn new(schema: &Schema) -> Result<Self, Error> {
+        let Schema::Tagged {
+            name,
+            tag,
+            payloads,
+            ..
+        } = schema
+        else {
+            return Err(Error("expected an enum with fields".into()));
+        };
+        let Schema::Enum {
+            variants, width, ..
+        } = &**tag
+        else {
+            return Err(Error("malformed enum tag".into()));
+        };
+        let mut widths = Vec::new();
+        let mut payload = 0u32;
+        for (variant, _) in payloads {
+            let layout = schema.variant_layout(variant)?;
+            payload = payload.max(layout.iter().map(|&(_, _, w)| u32::from(w)).sum());
+            widths.push(layout.into_iter().map(|(_, _, w)| w).collect());
+        }
+        Ok(Self {
+            name,
+            variants: variants.clone(),
+            fields: payloads.iter().map(|(_, f)| f.clone()).collect(),
+            widths,
+            tag_width: *width,
+            payload: u16::try_from(payload).expect("variant_layout checks MAX_WIDTH"),
+        })
+    }
+    /// Leaves of a value: the tag, and the payload unless it is empty.
+    pub fn leaves(&self) -> usize {
+        1 + usize::from(self.payload > 0)
+    }
+    /// The leaves of variant `index` with these field leaves; payload bits
+    /// above the variant are zero.
+    pub fn encode(&self, index: usize, fields: &[BitVec]) -> Result<Vec<BitVec>, Error> {
+        let widths = &self.widths[index];
+        if fields.len() != widths.len() {
+            return Err(Error("variant field leaf count mismatch".into()));
+        }
+        if fields.iter().zip(widths).any(|(v, &w)| !v.fits(w)) {
+            return Err(Error("value exceeds leaf width".into()));
+        }
+        let mut leaves = vec![BitVec::from(self.variants[index].1)];
+        if self.payload > 0 {
+            let parts: Vec<_> = fields.iter().zip(widths.iter().copied()).collect();
+            leaves.push(BitVec::pack(&parts, self.payload));
+        }
+        Ok(leaves)
+    }
+    /// The variant index and field leaves of the next value in `values`.
+    pub fn decode(
+        &self,
+        values: &mut impl Iterator<Item = BitVec>,
+    ) -> Result<(usize, Vec<BitVec>), Error> {
+        let tag = values
+            .next()
+            .ok_or_else(|| Error("missing value leaf".into()))?;
+        let index = self
+            .variants
+            .iter()
+            .position(|(_, d)| tag == *d)
+            .ok_or_else(|| Error(format!("invalid {} discriminant", self.name)))?;
+        let payload = if self.payload > 0 {
+            let payload = values
+                .next()
+                .ok_or_else(|| Error("missing value leaf".into()))?;
+            if !payload.fits(self.payload) {
+                return Err(Error("value exceeds leaf width".into()));
+            }
+            payload
+        } else {
+            BitVec::zero()
+        };
+        let mut offset = 0;
+        let fields = self.widths[index]
+            .iter()
+            .map(|&width| {
+                let field = payload.extract(offset, width);
+                offset += width;
+                field
+            })
+            .collect();
+        Ok((index, fields))
     }
 }
 
@@ -353,13 +662,48 @@ impl Symbolic {
         schema: Schema,
         leaves: &[BitVec],
     ) -> Result<Self, Error> {
+        let masks = schema.valid_bits(leaves)?;
         let values = schema
             .leaves()
             .iter()
-            .zip(leaves)
-            .map(|((_, leaf), value)| builder.constant(leaf.width()?, value))
+            .zip(leaves.iter().zip(&masks))
+            .map(|((_, leaf), (value, mask))| {
+                Self::masked_constant(builder, value, mask, leaf.width()?)
+            })
             .collect::<Result<_, _>>()?;
         Ok(Self { schema, values })
+    }
+    /// A `width`-bit constant whose bits outside `mask` are undefined: runs
+    /// of valid bits are constants, runs of don't-care bits undefined nodes.
+    fn masked_constant(
+        builder: &mut Builder,
+        value: &BitVec,
+        mask: &BitVec,
+        width: u16,
+    ) -> Result<NodeId, Error> {
+        if *mask == BitVec::ones(width) {
+            return builder.constant(width, value);
+        }
+        let mut result: Option<NodeId> = None;
+        let mut start = 0;
+        while start < width {
+            let valid = mask.bit(usize::from(start));
+            let mut end = start + 1;
+            while end < width && mask.bit(usize::from(end)) == valid {
+                end += 1;
+            }
+            let run = if valid {
+                builder.constant(end - start, value.extract(start, end - start))?
+            } else {
+                builder.undefined(end - start)?
+            };
+            result = Some(match result {
+                None => run,
+                Some(low) => builder.concat(run, low)?,
+            });
+            start = end;
+        }
+        result.ok_or_else(|| Error("empty constant".into()))
     }
     /// The zero value of `schema` (see [`LogicValue::zeroed`]).
     pub fn zero(builder: &mut Builder, schema: &Schema) -> Result<Self, Error> {
@@ -546,8 +890,9 @@ impl Symbolic {
         Ok(values)
     }
     /// A brace or tuple constructor `path { .. }` / `path(..)`: a struct, or
-    /// the variant `variant` (the path's last segment) of a data enum.
-    /// Fields of the other variants are zero.
+    /// the variant `variant` (the path's last segment) of a data enum. A
+    /// variant's field leaves are packed into the payload; the bits above
+    /// them are undefined (don't-care).
     pub fn construct(
         builder: &mut Builder,
         schema: Schema,
@@ -562,18 +907,11 @@ impl Symbolic {
                 Ok(Self { schema, values })
             }
             Schema::Tagged { tag, .. } => {
-                let (discriminant, offset, expected) = schema.variant_fields(variant)?;
-                let payload = Self::gather(expected, &fields)?;
-                let leaves = schema.leaves();
-                let zeros = schema.zero_values();
-                let mut values = Vec::with_capacity(leaves.len());
-                values.push(builder.constant(tag.width()?, discriminant)?);
-                for (i, (_, leaf)) in leaves.iter().enumerate().skip(1) {
-                    values.push(if (offset..offset + payload.len()).contains(&i) {
-                        payload[i - offset]
-                    } else {
-                        builder.constant(leaf.width()?, &zeros[i])?
-                    });
+                let (_, discriminant, expected) = schema.variant_fields(variant)?;
+                let leaves = Self::gather(expected, &fields)?;
+                let mut values = vec![builder.constant(tag.width()?, discriminant)?];
+                if let Some(width) = schema.payload_leaf() {
+                    values.push(Self::pack(builder, &leaves, width)?);
                 }
                 Ok(Self { schema, values })
             }
@@ -582,35 +920,69 @@ impl Symbolic {
             )),
         }
     }
-    /// For two data enum values, one with a constant tag: the leaf range of
-    /// that variant's fields.
+    /// `leaves` laid out from bit 0 upwards in a `width`-bit value, the bits
+    /// above them undefined.
+    fn pack(builder: &mut Builder, leaves: &[NodeId], width: u16) -> Result<NodeId, Error> {
+        let mut packed: Option<NodeId> = None;
+        let mut used = 0;
+        for &leaf in leaves {
+            used += builder.node_width(leaf)?;
+            packed = Some(match packed {
+                None => leaf,
+                Some(low) => builder.concat(leaf, low)?,
+            });
+        }
+        if used < width {
+            let padding = builder.undefined(width - used)?;
+            packed = Some(match packed {
+                None => padding,
+                Some(low) => builder.concat(padding, low)?,
+            });
+        }
+        packed.ok_or_else(|| Error("empty enum payload".into()))
+    }
+    /// The field leaves of `variant`, sliced out of a data enum value's
+    /// payload (wires only; meaningful when the value is that variant).
+    /// With `field`, only that field's leaves.
+    fn variant_leaves(
+        builder: &mut Builder,
+        schema: &Schema,
+        values: &[NodeId],
+        variant: &str,
+        field: Option<&str>,
+    ) -> Result<Vec<NodeId>, Error> {
+        let mut leaves = Vec::new();
+        for (path, offset, width) in schema.variant_layout(variant)? {
+            let selected = field.is_none_or(|f| {
+                path == f
+                    || path
+                        .strip_prefix(f)
+                        .is_some_and(|rest| rest.starts_with('.'))
+            });
+            if selected {
+                leaves.push(builder.slice(values[1], offset, width)?);
+            }
+        }
+        Ok(leaves)
+    }
+    /// For a data enum compared with another, the index of the variant when
+    /// either side's tag is a constant (`None` for an invalid constant tag).
     fn known_variant(
-        &self,
         builder: &Builder,
-        rhs: &Self,
-    ) -> Result<Option<std::ops::Range<usize>>, Error> {
-        let Schema::Tagged { tag, payloads, .. } = &self.schema else {
-            return Ok(None);
+        schema: &Schema,
+        a: NodeId,
+        b: NodeId,
+    ) -> Option<Option<usize>> {
+        let Schema::Tagged { tag, .. } = schema else {
+            return None;
         };
         let Schema::Enum { variants, .. } = &**tag else {
-            return Ok(None);
+            return None;
         };
-        let constant = builder
-            .constant_value(self.values[0])
-            .or_else(|| builder.constant_value(rhs.values[0]));
-        let Some(value) = constant else {
-            return Ok(None);
-        };
-        let Some(((name, fields), _)) = payloads
-            .iter()
-            .zip(variants)
-            .find(|(_, (_, v))| *value == *v)
-        else {
-            return Ok(None);
-        };
-        let (_, offset, _) = self.schema.variant_fields(name)?;
-        let count: usize = fields.iter().map(|(_, f)| f.leaves().len()).sum();
-        Ok(Some(offset..offset + count))
+        let value = builder
+            .constant_value(a)
+            .or_else(|| builder.constant_value(b))?;
+        Some(variants.iter().position(|(_, v)| *value == *v))
     }
     /// The constant a pattern tests: a scalar pattern's value, or a data
     /// enum pattern's tag.
@@ -626,7 +998,7 @@ impl Symbolic {
         self.schema
             .variant_fields(variant)
             .ok()
-            .map(|(tag, _, _)| BitVec::from(tag))
+            .map(|(_, tag, _)| BitVec::from(tag))
     }
     /// A `match`: each arm's tests `(hit, tested constant)` and value, tried
     /// in order; the last arm is the default, and its tests are given when it
@@ -720,7 +1092,7 @@ impl Symbolic {
     }
     /// Whether a data enum value is `variant`: one comparison on its tag.
     pub fn is_variant(&self, builder: &mut Builder, variant: &str) -> Result<Self, Error> {
-        let (discriminant, _, _) = self.schema.variant_fields(variant)?;
+        let (_, discriminant, _) = self.schema.variant_fields(variant)?;
         let Schema::Tagged { tag, .. } = &self.schema else {
             unreachable!("variant_fields checked the schema");
         };
@@ -730,21 +1102,24 @@ impl Symbolic {
             values: vec![builder.binary(Binary::Eq, self.values[0], expected)?],
         })
     }
-    /// Field `field` of variant `variant` (wires only; meaningful when the
-    /// value is that variant).
-    pub fn variant_field(&self, variant: &str, field: &str) -> Result<Self, Error> {
-        let (_, mut offset, fields) = self.schema.variant_fields(variant)?;
-        for (name, schema) in fields {
-            let count = schema.leaves().len();
-            if name == field {
-                return Ok(Self {
-                    schema: schema.clone(),
-                    values: self.values[offset..offset + count].to_vec(),
-                });
-            }
-            offset += count;
-        }
-        Err(Error(format!("variant {variant} has no field {field}")))
+    /// Field `field` of variant `variant`: slices of the payload (wires
+    /// only; meaningful when the value is that variant).
+    pub fn variant_field(
+        &self,
+        builder: &mut Builder,
+        variant: &str,
+        field: &str,
+    ) -> Result<Self, Error> {
+        let (_, _, fields) = self.schema.variant_fields(variant)?;
+        let Some((_, schema)) = fields.iter().find(|(name, _)| name == field) else {
+            return Err(Error(format!("variant {variant} has no field {field}")));
+        };
+        let values =
+            Self::variant_leaves(builder, &self.schema, &self.values, variant, Some(field))?;
+        Ok(Self {
+            schema: schema.clone(),
+            values,
+        })
     }
     /// A constant `match` pattern test: data enums compare only their tag,
     /// everything else compares with `==`.
@@ -821,8 +1196,9 @@ impl Symbolic {
             values: vec![value],
         })
     }
-    /// `==` / `!=` on structs, arrays and data enums: every leaf equal
-    /// (inactive variant fields are always zero, so this is Rust's `==`).
+    /// `==` / `!=` on structs, arrays and data enums, as Rust's derived
+    /// `PartialEq`: data enums compare their tags and the active variant's
+    /// fields, never the payload bits above it.
     fn aggregate_equal(
         &self,
         builder: &mut Builder,
@@ -834,25 +1210,7 @@ impl Symbolic {
                 "structs, arrays and enums with fields support only == and !=".into(),
             ));
         }
-        let pairs: Vec<(NodeId, NodeId)> = match self.known_variant(builder, rhs)? {
-            // Against a value whose variant is known, only the tag and that
-            // variant's fields can differ: other fields are zero on both sides.
-            Some(range) => std::iter::once(0)
-                .chain(range)
-                .map(|i| (self.values[i], rhs.values[i]))
-                .collect(),
-            None => self
-                .values
-                .iter()
-                .copied()
-                .zip(rhs.values.iter().copied())
-                .collect(),
-        };
-        let mut all = builder.constant(1, 1)?;
-        for (a, b) in pairs {
-            let same = builder.binary(Binary::Eq, a, b)?;
-            all = builder.binary(Binary::And, all, same)?;
-        }
+        let mut all = Self::equal(builder, &self.schema, &self.values, &rhs.values)?;
         if op == Binary::Ne {
             all = builder.not(all)?;
         }
@@ -860,6 +1218,74 @@ impl Symbolic {
             schema: Schema::Bool,
             values: vec![all],
         })
+    }
+    /// `a == b` for leaf nodes of a value of `schema`, as one bool node.
+    fn equal(
+        builder: &mut Builder,
+        schema: &Schema,
+        a: &[NodeId],
+        b: &[NodeId],
+    ) -> Result<NodeId, Error> {
+        fn and(builder: &mut Builder, all: Option<NodeId>, next: NodeId) -> Result<NodeId, Error> {
+            match all {
+                None => Ok(next),
+                Some(all) => builder.binary(Binary::And, all, next),
+            }
+        }
+        /// Each child's equality, ANDed; `true` for no children.
+        fn children<'s>(
+            builder: &mut Builder,
+            schemas: impl Iterator<Item = &'s Schema>,
+            a: &[NodeId],
+            b: &[NodeId],
+        ) -> Result<NodeId, Error> {
+            let mut all = None;
+            let mut offset = 0;
+            for schema in schemas {
+                let count = schema.leaves().len();
+                let range = offset..offset + count;
+                let same = Symbolic::equal(builder, schema, &a[range.clone()], &b[range])?;
+                all = Some(and(builder, all, same)?);
+                offset += count;
+            }
+            all.map_or_else(|| builder.constant(1, 1), Ok)
+        }
+        match schema {
+            Schema::Struct { fields, .. } => children(builder, fields.iter().map(|(_, f)| f), a, b),
+            Schema::Array { element, len } => {
+                children(builder, std::iter::repeat_n(&**element, *len), a, b)
+            }
+            Schema::Tagged { tag, payloads, .. } => {
+                let Schema::Enum { variants, .. } = &**tag else {
+                    return Err(Error("malformed enum tag".into()));
+                };
+                let known = Self::known_variant(builder, schema, a[0], b[0]);
+                let mut all = Some(builder.binary(Binary::Eq, a[0], b[0])?);
+                for (index, ((variant, fields), (_, discriminant))) in
+                    payloads.iter().zip(variants).enumerate()
+                {
+                    let skip = known.is_some_and(|k| k != Some(index));
+                    if skip || fields.iter().all(|(_, f)| f.leaves().is_empty()) {
+                        continue;
+                    }
+                    let fa = Self::variant_leaves(builder, schema, a, variant, None)?;
+                    let fb = Self::variant_leaves(builder, schema, b, variant, None)?;
+                    let same = children(builder, fields.iter().map(|(_, f)| f), &fa, &fb)?;
+                    // With the variant unknown: (tag != variant) || fields equal.
+                    let term = if known.is_some() {
+                        same
+                    } else {
+                        let at = builder.constant(tag.width()?, *discriminant)?;
+                        let is = builder.binary(Binary::Eq, a[0], at)?;
+                        let other = builder.not(is)?;
+                        builder.binary(Binary::Or, other, same)?
+                    };
+                    all = Some(and(builder, all, term)?);
+                }
+                Ok(all.expect("the tag comparison"))
+            }
+            _ => builder.binary(Binary::Eq, a[0], b[0]),
+        }
     }
     pub fn mux(
         builder: &mut Builder,

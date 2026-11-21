@@ -17,7 +17,7 @@ pub(crate) fn fail<T>(message: &str) -> Result<T, Error> {
     Err(Error(message.into()))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub(crate) usize);
 impl NodeId {
     pub fn index(self) -> usize {
@@ -25,7 +25,7 @@ impl NodeId {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Binary {
     And,
     Or,
@@ -40,7 +40,7 @@ pub enum Binary {
     Ge,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Operation {
     Input(usize),
     Constant(BitVec),
@@ -359,22 +359,15 @@ impl Logic {
             )
             .collect();
         let mut text = format!("module {module}(\n    {}\n);\n", ports.join(",\n    "));
-        // Name the encodings of enum-typed ports.
+        // Name the encodings of enum-typed ports and the layouts of data
+        // enum payloads.
         if let Some((input, output)) = &self.schemas {
             for (prefix, schema, ports) in
                 [("i", input, &self.inputs), ("o", output, &self.outputs)]
             {
-                for ((_, leaf), port) in schema.leaves().iter().zip(ports) {
-                    if let Schema::Enum { name, variants, .. } = leaf {
-                        let variants: Vec<_> =
-                            variants.iter().map(|(v, d)| format!("{v} = {d}")).collect();
-                        writeln!(
-                            text,
-                            "// {prefix}_{}: {name} {{ {} }}",
-                            port.name,
-                            variants.join(", ")
-                        )
-                        .unwrap();
+                for (note, port) in schema.leaf_notes().iter().zip(ports) {
+                    if let Some(note) = note {
+                        writeln!(text, "// {prefix}_{}: {note}", port.name).unwrap();
                     }
                 }
             }
@@ -567,27 +560,20 @@ pub struct Builder {
     nodes: Vec<Node>,
     inputs: Vec<Port>,
     outputs: Vec<Port>,
+    /// Ids of undefined (don't-care) nodes: zero constants that folds may
+    /// replace with any value. Only the builder knows; a finished [`Logic`]
+    /// sees zeros.
+    undefined: std::collections::BTreeSet<usize>,
+    /// Each pushed `(width, operation)` (inputs excepted): an identical
+    /// operation is the same node.
+    interned: std::collections::HashMap<(u16, Operation), NodeId>,
 }
 impl Builder {
     fn push(&mut self, width: u16, operation: Operation) -> Result<NodeId, Error> {
         if !(1..=MAX_WIDTH).contains(&width) {
             return Err(Error(format!("bit widths must be in 1..={MAX_WIDTH}")));
         }
-        // Constant folding: an operation on constants is a constant, a mux
-        // with a constant condition is the selected operand, and a mux between
-        // equal operands (one node, or equal constants) is that operand.
-        if let Operation::Mux { condition, yes, no } = operation {
-            if let Some(c) = self.constant_value(condition) {
-                return Ok(if c.is_zero() { no } else { yes });
-            }
-            if yes == no
-                || self
-                    .constant_value(yes)
-                    .is_some_and(|y| self.constant_value(no) == Some(y))
-            {
-                return Ok(yes);
-            }
-        }
+        // Constant folding: an operation on constants is a constant.
         let sources = operands(&operation);
         if !sources.is_empty() && sources.iter().all(|&id| self.constant_value(id).is_some()) {
             let mut out = vec![0; words_for(usize::from(width))];
@@ -602,7 +588,20 @@ impl Builder {
         }
         self.push_node(width, operation)
     }
+    /// A node for `operation`, shared with an identical earlier one.
     fn push_node(&mut self, width: u16, operation: Operation) -> Result<NodeId, Error> {
+        if let Some(&id) = self.interned.get(&(width, operation.clone())) {
+            return Ok(id);
+        }
+        let shared = !matches!(operation, Operation::Input(_));
+        let id = self.push_fresh(width, operation.clone())?;
+        if shared {
+            self.interned.insert((width, operation), id);
+        }
+        Ok(id)
+    }
+    /// A new node, never shared.
+    fn push_fresh(&mut self, width: u16, operation: Operation) -> Result<NodeId, Error> {
         if self.nodes.len() >= 65_536 {
             return fail("logic exceeds 65536 expression nodes");
         }
@@ -633,12 +632,33 @@ impl Builder {
         let value = value.into().masked(width);
         self.push(width, Operation::Constant(value))
     }
-    /// The value of `id` if it is a constant node.
+    /// The value of `id` if it is a constant node (undefined nodes are not).
     pub fn constant_value(&self, id: NodeId) -> Option<&BitVec> {
+        if self.is_undefined(id) {
+            return None;
+        }
         match &self.nodes.get(id.0)?.operation {
             Operation::Constant(value) => Some(value),
             _ => None,
         }
+    }
+    /// `width` don't-care bits: folds may give them any value; if they
+    /// survive, they are zero.
+    pub fn undefined(&mut self, width: u16) -> Result<NodeId, Error> {
+        if !(1..=MAX_WIDTH).contains(&width) {
+            return Err(Error(format!("bit widths must be in 1..={MAX_WIDTH}")));
+        }
+        // Not shared: a real zero constant must stay a zero.
+        let id = self.push_fresh(width, Operation::Constant(BitVec::zero()))?;
+        self.undefined.insert(id.0);
+        Ok(id)
+    }
+    /// Whether `id` is an undefined node.
+    pub fn is_undefined(&self, id: NodeId) -> bool {
+        self.undefined.contains(&id.0)
+    }
+    pub(crate) fn node_width(&self, id: NodeId) -> Result<u16, Error> {
+        self.width(id)
     }
     pub fn not(&mut self, a: NodeId) -> Result<NodeId, Error> {
         self.push(self.width(a)?, Operation::Not(a))
@@ -658,22 +678,107 @@ impl Builder {
         };
         self.push(result, Operation::Binary(op, a, b))
     }
+    /// A mux, folded: a constant condition selects an operand; undefined
+    /// operands and muxes between equal operands (one node, or equal
+    /// constants) are the other operand; and a mux of a concatenation is
+    /// split at its low part, so constant, undefined and equal segments fold
+    /// separately.
     pub fn mux(&mut self, condition: NodeId, yes: NodeId, no: NodeId) -> Result<NodeId, Error> {
         let width = self.width(yes)?;
         if self.width(condition)? != 1 || width != self.width(no)? {
             return fail("mux type mismatch");
         }
+        if let Some(c) = self.constant_value(condition) {
+            return Ok(if c.is_zero() { no } else { yes });
+        }
+        if self.is_undefined(yes) {
+            return Ok(no);
+        }
+        if self.is_undefined(no)
+            || yes == no
+            || self
+                .constant_value(yes)
+                .is_some_and(|y| self.constant_value(no) == Some(y))
+        {
+            return Ok(yes);
+        }
+        let split = [yes, no]
+            .into_iter()
+            .find_map(|id| match self.nodes[id.0].operation {
+                Operation::Concat(_, low) => Some(self.nodes[low.0].width),
+                _ => None,
+            });
+        if let Some(low) = split {
+            let high = width - low;
+            let (yes_high, no_high) = (self.slice(yes, low, high)?, self.slice(no, low, high)?);
+            let (yes_low, no_low) = (self.slice(yes, 0, low)?, self.slice(no, 0, low)?);
+            let high = self.mux(condition, yes_high, no_high)?;
+            let low = self.mux(condition, yes_low, no_low)?;
+            return self.concat(high, low);
+        }
         self.push(width, Operation::Mux { condition, yes, no })
     }
+    /// Bits `offset..offset + width` of `value`, folded through slices and
+    /// concatenations: a slice inside one part of a concatenation is a slice
+    /// of that part.
     pub fn slice(&mut self, value: NodeId, offset: u16, width: u16) -> Result<NodeId, Error> {
-        if width == 0 || u32::from(offset) + u32::from(width) > u32::from(self.width(value)?) {
+        let full = self.width(value)?;
+        if width == 0 || u32::from(offset) + u32::from(width) > u32::from(full) {
             return fail("slice out of bounds");
+        }
+        if offset == 0 && width == full {
+            return Ok(value);
+        }
+        if self.is_undefined(value) {
+            return self.undefined(width);
+        }
+        match self.nodes[value.0].operation {
+            Operation::Slice {
+                value: inner,
+                offset: base,
+            } => {
+                return self.slice(inner, base + offset, width);
+            }
+            Operation::Concat(high, low) => {
+                let split = self.nodes[low.0].width;
+                if offset + width <= split {
+                    return self.slice(low, offset, width);
+                }
+                if offset >= split {
+                    return self.slice(high, offset - split, width);
+                }
+                let high = self.slice(high, 0, offset + width - split)?;
+                let low = self.slice(low, offset, split - offset)?;
+                return self.concat(high, low);
+            }
+            _ => {}
         }
         self.push(width, Operation::Slice { value, offset })
     }
+    /// `{a, b}`, folded: undefined parts give undefined bits, and adjacent
+    /// slices of one value are one slice.
     pub fn concat(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, Error> {
-        let width = u32::from(self.width(a)?) + u32::from(self.width(b)?);
-        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let (high, low) = (self.width(a)?, self.width(b)?);
+        let width = u16::try_from(u32::from(high) + u32::from(low)).unwrap_or(u16::MAX);
+        if self.is_undefined(a) && self.is_undefined(b) {
+            return self.undefined(width);
+        }
+        if let (
+            Operation::Slice {
+                value: x,
+                offset: ox,
+            },
+            Operation::Slice {
+                value: y,
+                offset: oy,
+            },
+        ) = (&self.nodes[a.0].operation, &self.nodes[b.0].operation)
+            && x == y
+            && *ox == oy + low
+        {
+            let (value, offset) = (*x, *oy);
+            return self.slice(value, offset, width);
+        }
         self.push(width, Operation::Concat(a, b))
     }
     pub fn shift(&mut self, value: NodeId, amount: u32, left: bool) -> Result<NodeId, Error> {

@@ -275,6 +275,73 @@ The arty_ethernet suite (51 tests, including Vivado xsim) passes, and its
 nine generated Verilog files are byte-identical before and after the change. Native simulation is not slower: `≤64`-bit `Bits` operations and
 interpreter nodes take single-word paths.
 
+## Tagged-union layout for enums with fields (2026-11-21)
+
+Enums with fields now use one payload leaf as wide as the widest variant,
+instead of a leaf per field of every variant. The bits above the current
+variant are don't-care. This replaces the layout and the canonical-zero rule
+described in [Enums with fields](#enums-with-fields-2026-11-21), and the tests
+there were rewritten for it. `tests/adts.rs` (13 tests) checks:
+
+- **The 592-state machine.** Native Rust matches the integer oracle. The IR,
+  fed each state's leaves with random bits in every don't-care payload bit
+  (about a third of the inputs carry some), decodes to the native result.
+  Icarus runs the same padded inputs and its outputs are compared under
+  `Schema::valid_bits` masks.
+- **Layout.** Payload width, `variant_layout` offsets, the zero value, the
+  `flatten`/`read` round trip of all 37 values, and `read` ignoring padding
+  while rejecting an invalid field encoding, an invalid tag and an over-wide
+  payload. Also `encode_variant`, `decode_variant` and `valid_bits`.
+- **Generated Verilog.** The `*_payload` ports and the payload-layout comment.
+- **Nested enums with fields.** Payload offsets, and masks that also ignore the
+  inner enum's padding.
+- **Unknown-value `==` and `!=`.** Every pair of 37 `Cmd` values and of 21
+  nested `Outer` values, each with random padding, in the IR and Icarus.
+- **Lowering cost.**
+  - Rebuilding a `Cmd` variant by variant builds 3 tag muxes and no payload
+    mux, and the output payload is the input port.
+  - Moving a field shared as the first field of two variants builds only
+    1-bit (tag) muxes.
+  - `==` against a unit variant is one comparison.
+- **Registers.** A `system!` register holding a data enum agrees between the
+  native and interpreted cycle models. A data enum whose zero value has a
+  nonzero payload is rejected as a register state.
+
+`tests/logic.rs` adds a builder test of the new folds:
+- slices through concatenations and slices;
+- adjacent slices rejoined;
+- a straddling slice;
+- don't-care mux operands;
+- a mux split that leaves no mux;
+- shared nodes.
+
+It also checks 500 random evaluations against an oracle. `tests/wide.rs`
+checks a 160-bit payload leaf and its 161-bit rejection.
+
+Five implementation mutations each made at least two tests fail:
+- `==` comparing only tags;
+- a mux keeping its don't-care operand;
+- no mux splitting;
+- zero instead of don't-care padding;
+- variant field reads taking every payload leaf.
+
+**arty_ethernet.** All 51 tests pass, including Vivado xsim. The step tests now
+evaluate the IR on raw leaves with random padding. The book's phase register
+is a 4-bit tag plus a 194-bit payload, down from 354 bits of per-field leaves.
+Vivado 2025.2 synthesis only (`synth_design`, hierarchy kept, xc7a100t),
+before and after:
+
+| | LUTs | FFs |
+|---|---|---|
+| `book_unit` | 1008 → 895 | 631 → 472 |
+| `proto_unit` | 2426 → 2229 | 2001 → 2001 |
+| whole design | 4724 → 4415 | 3659 → 3500 |
+
+`proto_unit` has no enums with fields; it gains from node sharing and the new
+folds. The other units move by at most 5 LUTs (`feed_unit` 765 → 770,
+`tx_unit` 165 → 161). This is a synthesis estimate, not a placed-and-routed or timing result.
+The generated RTL changes in every module that the new folds touch.
+
 ## Fixed-capacity sets and maps (2026-11-18)
 
 `tests/collections.rs` drives a `fixed_set!` of 43-bit keys with 5 slots (not

@@ -216,10 +216,16 @@ fn data_enums_carry_wide_fields() {
         }
     );
     check_hdl(&ir, "widen", &cases);
-    // A 160-bit leaf round-trips; one bit more is rejected.
-    assert!(
-        Frame::from_values(&[bv(2), bv(0), bv(0), BitVec::from_words(&[0, 0, 1 << 32])]).is_err()
-    );
+    // The payload is one 160-bit leaf (Raw, the widest variant); one bit more
+    // is rejected.
+    let widths: Vec<_> = Frame::schema()
+        .leaves()
+        .iter()
+        .map(|(_, leaf)| leaf.width().unwrap())
+        .collect();
+    assert_eq!(widths, [2, 160]);
+    assert!(Frame::from_values(&[bv(2), BitVec::from_words(&[0, 0, 1 << 32])]).is_err());
+    assert!(Frame::from_values(&[bv(2), BitVec::from_words(&[0, 0, 1 << 31])]).is_ok());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, LogicValue)]

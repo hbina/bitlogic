@@ -226,6 +226,40 @@ impl BitVec {
     pub fn to_verilog(&self, width: u16) -> String {
         format!("{width}'h{}", hex(self.words()))
     }
+    /// `width` one bits.
+    pub fn ones(width: u16) -> Self {
+        let mut words = vec![u64::MAX; words_for(usize::from(width))];
+        mask_top(&mut words, usize::from(width));
+        Self::from_words(&words)
+    }
+    /// Bits `offset..offset + width`.
+    pub fn extract(&self, offset: u16, width: u16) -> Self {
+        let mut words = vec![0; words_for(usize::from(width))];
+        shr(
+            &mut words,
+            self.words(),
+            usize::from(offset),
+            usize::from(width),
+        );
+        Self::from_words(&words)
+    }
+    /// `(value, width)` parts laid out from bit 0 upwards, in a `width`-bit
+    /// value. Each part is cut to its width.
+    pub fn pack(parts: &[(&BitVec, u16)], width: u16) -> Self {
+        let size = words_for(usize::from(width));
+        let (mut words, mut part) = (vec![0; size], vec![0; size]);
+        let mut offset = 0;
+        for &(value, part_width) in parts {
+            let mut cut = value.words().to_vec();
+            mask_top(&mut cut, usize::from(part_width));
+            shl(&mut part, &cut, offset, usize::from(width));
+            for (w, p) in words.iter_mut().zip(&part) {
+                *w |= p;
+            }
+            offset += usize::from(part_width);
+        }
+        Self::from_words(&words)
+    }
 }
 
 impl From<u64> for BitVec {

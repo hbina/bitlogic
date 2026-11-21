@@ -632,7 +632,7 @@ impl Design {
         // The register resets to all zeros, so the zero value must be that.
         if u.state.zero_values().iter().any(|v| !v.is_zero()) {
             return fail(format!(
-                "unit `{}`: state enums (also inside variant fields) must list a variant with discriminant 0 first",
+                "unit `{}`: state enums (also the first variant's fields of a data enum) must list a variant with discriminant 0 first",
                 u.name
             ));
         }

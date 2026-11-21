@@ -167,14 +167,13 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
         }
     })
 }
-/// Enums whose variants carry fields: the discriminant leaf, then every
-/// variant's fields, with the fields of inactive variants at their zero value.
+/// Enums whose variants carry fields: the tag leaf and one payload leaf
+/// holding the active variant's fields (see `Packing`).
 fn derive_tagged(name: &syn::Ident, data: &syn::DataEnum, values: &[u64]) -> syn::Result<Tokens> {
     let mut schemas = Vec::new();
-    let mut tags = Vec::new();
-    let mut payloads = Vec::new();
-    let mut reads = Vec::new();
-    for (variant, value) in data.variants.iter().zip(values) {
+    let mut encodes = Vec::new();
+    let mut decodes = Vec::new();
+    for (index, (variant, value)) in data.variants.iter().zip(values).enumerate() {
         let ident = &variant.ident;
         let label = clean(ident);
         let types: Vec<_> = variant.fields.iter().map(|f| &f.ty).collect();
@@ -192,58 +191,64 @@ fn derive_tagged(name: &syn::Ident, data: &syn::DataEnum, values: &[u64]) -> syn
         let locals: Vec<_> = (0..types.len())
             .map(|i| format_ident!("__field{i}"))
             .collect();
-        // The variant as a pattern binding `locals`, and as an expression.
-        let shape = match &variant.fields {
+        let reads = types
+            .iter()
+            .map(|ty| quote!(<#ty as ::bitlogic::LogicValue>::read(&mut __fields)?));
+        // The variant as a pattern binding `locals`, and rebuilt from leaves.
+        let (shape, decode) = match &variant.fields {
             syn::Fields::Named(f) => {
-                let names = f.named.iter().map(|f| f.ident.as_ref().unwrap());
-                quote!(Self::#ident { #(#names: #locals),* })
+                let names: Vec<_> = f.named.iter().map(|f| f.ident.as_ref().unwrap()).collect();
+                (
+                    quote!(Self::#ident { #(#names: #locals),* }),
+                    quote!(Self::#ident { #(#names: #reads),* }),
+                )
             }
-            syn::Fields::Unnamed(_) => quote!(Self::#ident(#(#locals),*)),
-            syn::Fields::Unit => quote!(Self::#ident),
+            syn::Fields::Unnamed(_) => (
+                quote!(Self::#ident(#(#locals),*)),
+                quote!(Self::#ident(#(#reads),*)),
+            ),
+            syn::Fields::Unit => (quote!(Self::#ident), quote!(Self::#ident)),
         };
         schemas.push(quote!((#label.into(), #value, ::std::vec![#((#labels.into(), <#types as ::bitlogic::LogicValue>::schema())),*])));
-        let wild = match &variant.fields {
-            syn::Fields::Named(_) => quote!(Self::#ident { .. }),
-            syn::Fields::Unnamed(_) => quote!(Self::#ident(..)),
-            syn::Fields::Unit => quote!(Self::#ident),
-        };
-        tags.push(quote!(#wild => #value));
-        if !types.is_empty() {
-            payloads.push(quote! {
-                match self {
-                    #shape => { #(values.extend(::bitlogic::LogicValue::flatten(#locals));)* }
-                    _ => { #(values.extend(<#types as ::bitlogic::LogicValue>::schema().zero_values());)* }
-                }
-            });
-        }
-        reads.push(if types.is_empty() {
-            quote!(if tag == Some(#value) { result = Some(#shape); })
+        encodes.push(if types.is_empty() {
+            quote!(#shape => (#index, ::std::vec::Vec::new()))
         } else {
-            quote! {
-                #(let #locals = <#types as ::bitlogic::LogicValue>::read(values)?;)*
-                if tag == Some(#value) {
-                    result = Some(#shape);
-                } else if #(::bitlogic::LogicValue::flatten(&#locals) != <#types as ::bitlogic::LogicValue>::schema().zero_values())||* {
-                    return Err(::bitlogic::Error(concat!("non-canonical inactive ", stringify!(#name), " variant fields").into()));
-                }
-            }
+            quote!(#shape => {
+                let mut __leaves = ::std::vec::Vec::new();
+                #(__leaves.extend(::bitlogic::LogicValue::flatten(#locals));)*
+                (#index, __leaves)
+            })
         });
+        decodes.push(quote!(#index => #decode));
     }
+    // One layout per type (derived types are not generic).
+    let packing = quote! {
+        static PACKING: ::std::sync::OnceLock<::std::result::Result<::bitlogic::__private::Packing, ::bitlogic::Error>> =
+            ::std::sync::OnceLock::new();
+        let packing = PACKING.get_or_init(|| {
+            ::bitlogic::__private::Packing::new(&<Self as ::bitlogic::LogicValue>::schema())
+        });
+    };
     Ok(quote! {
         impl ::bitlogic::LogicValue for #name {
             fn schema() -> ::bitlogic::Schema {
                 ::bitlogic::Schema::tagged::<Self>(::std::vec![#(#schemas),*])
             }
             fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
-                let mut values = ::std::vec![::bitlogic::BitVec::from(match self { #(#tags),* })];
-                #(#payloads)*
-                values
+                #packing
+                let packing = packing.as_ref().expect(concat!("valid ", stringify!(#name), " layout"));
+                let (index, leaves): (usize, ::std::vec::Vec<::bitlogic::BitVec>) = match self { #(#encodes),* };
+                packing.encode(index, &leaves).expect("derived values fit their leaves")
             }
             fn read(values: &mut impl ::std::iter::Iterator<Item=::bitlogic::BitVec>) -> ::std::result::Result<Self,::bitlogic::Error> {
-                let tag = values.next().ok_or_else(|| ::bitlogic::Error("missing value leaf".into()))?.to_u64();
-                let mut result = None;
-                #(#reads)*
-                result.ok_or_else(|| ::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into()))
+                #packing
+                let packing = packing.as_ref().map_err(::std::clone::Clone::clone)?;
+                let (index, fields) = packing.decode(values)?;
+                let mut __fields = fields.into_iter();
+                ::std::result::Result::Ok(match index {
+                    #(#decodes,)*
+                    _ => unreachable!("decode returns a variant index"),
+                })
             }
         }
     })
@@ -556,7 +561,7 @@ impl Lower {
         }
         let name = immutable_binding(pat)?;
         let scrutinee = arm.scrutinee;
-        let value = self.emit(quote!(#scrutinee.variant_field(#variant,#field)?));
+        let value = self.emit(quote!(#scrutinee.variant_field(__logic_builder,#variant,#field)?));
         arm.bindings.push((clean(name), value));
         Ok(())
     }

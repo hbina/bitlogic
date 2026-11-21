@@ -107,9 +107,17 @@ Generated Verilog names each enum port's encoding in a comment.
 Arms are tried in source order, as in Rust; rustc's exhaustiveness check on the
 native function lets the last arm act as the default. `matches!(value,
 pattern)` is the same as `match value { pattern => true, _ => false }`. Guards
-are unsupported. Constant expressions are folded while the graph is built: an
-operation on constants is a constant, a mux with a constant condition is the
-selected value, and a mux between equal operands is that operand.
+are unsupported. The graph is simplified while it is built:
+
+- An operation on constants is a constant, and an identical operation on the
+  same operands is the same node.
+- A mux with a constant condition is the selected value. A mux between equal
+  operands, or with a don't-care operand (see
+  [Enums with fields](#enums-with-fields)), is the other operand.
+- A mux of a concatenation is split at the concatenation's boundary, so each
+  part folds on its own.
+- A slice of a concatenation or of a slice is a slice of the underlying part,
+  and adjacent slices of one value concatenate back to a single slice.
 
 When the arms test distinct constants (distinct variants, or distinct `const`
 or `true`/`false` values), at most one arm can match, and the lowering uses
@@ -129,25 +137,49 @@ Overlapping patterns keep the plain priority chain.
 
 An enum with at least one variant that has fields (`Load { addr: Bits<3> }`,
 `Store(Bits<3>, Mode)`) also derives `LogicValue`, with `Schema::Tagged`. It is
-not a leaf. Its leaves are:
+not a leaf. It is stored as a tagged union with two leaves:
 
 - `tag`: the discriminants of all variants, encoded exactly like a fieldless
   enum, with the same rules for implicit and literal discriminants;
-- then every field of every variant, in declaration order, under
-  `<Variant>.<field>`. Tuple fields are named `0`, `1`, ...
+- `payload`: `Bits<P>`, where `P` is the total leaf width of the widest
+  variant. The current variant's field leaves are packed into it from bit 0
+  upwards, in declaration order. Tuple fields are named `0`, `1`, ...
+  Nested structs, arrays and enums, including other enums with fields, pack
+  their own leaves recursively. There is no `payload` leaf when no variant has
+  any bits, and `P` may be at most 4096.
 
-Ports therefore look like `cmd_tag`, `cmd_Load_addr` and `cmd_Store_1`.
-Payloads do not overlap, and there is no niche filling: the value uses the tag
-width plus the width of every field.
+Ports therefore look like `cmd_tag` and `cmd_payload`. Generated Verilog names
+the tag encoding and the payload layout of each port in a comment, for example
+`// i_cmd_payload: Cmd payload { Nop, Load { addr [2:0], wide [3:3] }, ... }`.
+`Schema::variant_layout` returns the same layout as data. Variants share the
+payload's bits, so a register holding the enum is as wide as the tag plus the
+widest variant. Fields with the same position in several variants, such as a
+shared first field, sit at the same bits, and moving them from one variant to
+another needs no logic. There is no niche filling: the tag is always its own
+leaf.
 
-The fields of every variant other than the current one hold their zero values
-(zero bits, or the first variant of a fieldless enum). Construction guarantees
-this, `if` and `match` preserve it, and `LogicValue::read` rejects any other
-value. As a result, leaf-by-leaf `==`/`!=` is the same as Rust's derived
-`PartialEq`. Ordering comparisons and bit operations are `ir()` errors. Values
-supplied to generated HDL input ports must follow the same rule, just as a
-fieldless enum port must hold a valid discriminant. The zero value is the first
-variant with zero fields; a `system!` register needs it to be all zero bits.
+**Don't-care bits.** The payload bits above the current variant's fields
+mean nothing. Generated logic may leave any value there, and it never reads
+them:
+
+- `match` and variant patterns test only the tag.
+- `==`/`!=` compare like Rust's derived `PartialEq`: the tags, then the current
+  variant's fields (recursively, so nested padding is ignored too).
+- `LogicValue::read` ignores these bits. It still checks the tag, the payload
+  width and each field's own encoding.
+- `LogicValue::flatten` writes zeros there, so a native value has one encoding.
+  Hardware outputs may have others for the same value. Raw leaves (`BitVec`,
+  `Vec<BitVec>`) therefore compare and hash as bit patterns, padding included,
+  and bitlogic does not rewrite them. To compare values, decode them with
+  `read` and use the type's own `==`, or mask the leaves with
+  `Schema::valid_bits`. `Schema::encode_variant` and `Schema::decode_variant`
+  build and take apart the leaves directly.
+
+Ordering comparisons and bit operations are `ir()` errors. Values supplied to
+generated HDL input ports need a valid tag and valid field encodings, just as a
+fieldless enum port must hold a valid discriminant. Their padding may be
+anything. The zero value is the first variant with zero fields, and padding
+zero. A `system!` register needs it to be all zero bits.
 
 In `#[logic]` bodies:
 
@@ -163,8 +195,9 @@ In `#[logic]` bodies:
   tag. Bound fields are wires of the scrutinee, and their values only matter
   when that arm is selected.
 - **Comparisons:** `value == Cmd::Nop`, or `==` with any value whose tag is a
-  constant, compares only the tag and that variant's fields. The other fields
-  are zero on both sides.
+  constant, compares only the tag and that variant's fields. Two run-time
+  values compare their tags and, for each variant, that variant's fields
+  under its tag.
 
 ## Fixed-capacity sets and maps
 
