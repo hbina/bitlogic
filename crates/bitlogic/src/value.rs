@@ -24,7 +24,23 @@ pub enum Schema {
         width: u8,
         variants: Vec<(String, u64)>,
     },
+    /// An enum whose variants carry fields. Leaves are the `tag` (a
+    /// [`Schema::Enum`] of every variant), then each variant's fields in
+    /// declaration order under `<Variant>.<field>`; tuple fields are named
+    /// `0`, `1`, ... Fields of inactive variants hold their zero values.
+    Tagged {
+        identity: TypeId,
+        name: &'static str,
+        tag: Box<Schema>,
+        payloads: Vec<(String, Fields)>,
+    },
 }
+
+/// A `match` arm's tests: each hit and the constant it compares against.
+type Tests = Vec<(Symbolic, Option<u64>)>;
+
+/// Named field schemas of a struct-like enum variant.
+pub type Fields = Vec<(String, Schema)>;
 
 impl Schema {
     pub fn structure<T: 'static>(fields: Vec<(String, Schema)>) -> Self {
@@ -54,6 +70,45 @@ impl Schema {
         }
     }
 
+    /// Schema of an enum whose variants carry fields, from
+    /// `(variant, discriminant, fields)`.
+    pub fn tagged<T: 'static>(variants: Vec<(String, u64, Fields)>) -> Self {
+        let tag = Self::enumeration::<T>(
+            variants
+                .iter()
+                .map(|(name, value, _)| (name.clone(), *value))
+                .collect(),
+        );
+        Self::Tagged {
+            identity: TypeId::of::<T>(),
+            name: type_name::<T>(),
+            tag: Box::new(tag),
+            payloads: variants
+                .into_iter()
+                .map(|(name, _, fields)| (name, fields))
+                .collect(),
+        }
+    }
+
+    /// For a data enum: the variant's discriminant, the leaf offset of its
+    /// first field and its fields.
+    fn variant_fields(&self, variant: &str) -> Result<(u64, usize, &Fields), Error> {
+        let Self::Tagged { tag, payloads, .. } = self else {
+            return Err(Error("expected an enum with fields".into()));
+        };
+        let Self::Enum { variants, .. } = &**tag else {
+            return Err(Error("malformed enum tag".into()));
+        };
+        let mut offset = 1;
+        for ((name, fields), (_, value)) in payloads.iter().zip(variants) {
+            if name == variant {
+                return Ok((*value, offset, fields));
+            }
+            offset += fields.iter().map(|(_, f)| f.leaves().len()).sum::<usize>();
+        }
+        Err(Error(format!("unknown enum variant {variant}")))
+    }
+
     pub fn leaves(&self) -> Vec<(String, Schema)> {
         fn join(path: &str, name: &str) -> String {
             if path.is_empty() {
@@ -72,6 +127,15 @@ impl Schema {
                 Schema::Array { element, len } => {
                     for index in 0..*len {
                         visit(element, join(&path, &index.to_string()), result);
+                    }
+                }
+                Schema::Tagged { tag, payloads, .. } => {
+                    visit(tag, join(&path, "tag"), result);
+                    for (variant, fields) in payloads {
+                        let base = join(&path, variant);
+                        for (name, child) in fields {
+                            visit(child, join(&base, name), result);
+                        }
                     }
                 }
                 _ => result.push((path, schema.clone())),
@@ -132,7 +196,7 @@ pub trait LogicValue: Sized + 'static {
     }
 
     /// The zero value: all bits clear, except that enums take their first
-    /// variant. Out-of-range array reads return this.
+    /// variant (with zero fields). Out-of-range array reads return this.
     fn zeroed() -> Self {
         Self::from_values(&Self::schema().zero_values()).expect("zero value is valid")
     }
@@ -415,20 +479,239 @@ impl Symbolic {
         else {
             return Err(Error("expected struct type".into()));
         };
+        let values = Self::gather(expected, &fields)?;
+        Ok(Self { schema, values })
+    }
+    /// The leaves of `fields` in the order `expected` declares them.
+    fn gather(
+        expected: &[(String, Schema)],
+        fields: &[(&str, Self)],
+    ) -> Result<Vec<NodeId>, Error> {
         if expected.len() != fields.len() {
-            return Err(Error("incomplete struct value".into()));
+            return Err(Error("incomplete struct or variant value".into()));
         }
         let mut values = Vec::new();
         for (name, ty) in expected {
             let matches: Vec<_> = fields.iter().filter(|(n, _)| n == name).collect();
             if matches.len() != 1 || matches[0].1.schema != *ty {
-                return Err(Error(format!(
-                    "struct field {name} type/definition mismatch"
-                )));
+                return Err(Error(format!("field {name} type/definition mismatch")));
             }
             values.extend(&matches[0].1.values);
         }
-        Ok(Self { schema, values })
+        Ok(values)
+    }
+    /// A brace or tuple constructor `path { .. }` / `path(..)`: a struct, or
+    /// the variant `variant` (the path's last segment) of a data enum.
+    /// Fields of the other variants are zero.
+    pub fn construct(
+        builder: &mut Builder,
+        schema: Schema,
+        variant: &str,
+        fields: Vec<(&str, Self)>,
+    ) -> Result<Self, Error> {
+        match &schema {
+            Schema::Struct {
+                fields: expected, ..
+            } => {
+                let values = Self::gather(expected, &fields)?;
+                Ok(Self { schema, values })
+            }
+            Schema::Tagged { tag, .. } => {
+                let (discriminant, offset, expected) = schema.variant_fields(variant)?;
+                let payload = Self::gather(expected, &fields)?;
+                let leaves = schema.leaves();
+                let zeros = schema.zero_values();
+                let mut values = Vec::with_capacity(leaves.len());
+                values.push(builder.constant(tag.width()?, discriminant)?);
+                for (i, (_, leaf)) in leaves.iter().enumerate().skip(1) {
+                    values.push(if (offset..offset + payload.len()).contains(&i) {
+                        payload[i - offset]
+                    } else {
+                        builder.constant(leaf.width()?, zeros[i])?
+                    });
+                }
+                Ok(Self { schema, values })
+            }
+            _ => Err(Error(
+                "constructor paths must name a struct or an enum variant with fields".into(),
+            )),
+        }
+    }
+    /// For two data enum values, one with a constant tag: the leaf range of
+    /// that variant's fields.
+    fn known_variant(
+        &self,
+        builder: &Builder,
+        rhs: &Self,
+    ) -> Result<Option<std::ops::Range<usize>>, Error> {
+        let Schema::Tagged { tag, payloads, .. } = &self.schema else {
+            return Ok(None);
+        };
+        let Schema::Enum { variants, .. } = &**tag else {
+            return Ok(None);
+        };
+        let constant = builder
+            .constant_value(self.values[0])
+            .or_else(|| builder.constant_value(rhs.values[0]));
+        let Some(value) = constant else {
+            return Ok(None);
+        };
+        let Some(((name, fields), _)) = payloads
+            .iter()
+            .zip(variants)
+            .find(|(_, (_, v))| *v == value)
+        else {
+            return Ok(None);
+        };
+        let (_, offset, _) = self.schema.variant_fields(name)?;
+        let count: usize = fields.iter().map(|(_, f)| f.leaves().len()).sum();
+        Ok(Some(offset..offset + count))
+    }
+    /// The constant a pattern tests: a scalar pattern's value, or a data
+    /// enum pattern's tag.
+    pub fn pattern_key(&self, builder: &Builder, pattern: &Self) -> Option<u64> {
+        pattern
+            .values
+            .first()
+            .and_then(|&node| builder.constant_value(node))
+    }
+    /// The tag a variant pattern tests.
+    pub fn variant_key(&self, variant: &str) -> Option<u64> {
+        self.schema
+            .variant_fields(variant)
+            .ok()
+            .map(|(tag, _, _)| tag)
+    }
+    /// A `match`: each arm's tests `(hit, tested constant)` and value, tried
+    /// in order; the last arm is the default, and its tests are given when it
+    /// has patterns (not `_`).
+    ///
+    /// When every tested constant is known and distinct, at most one test
+    /// holds. If the last arm also has tests, rustc's exhaustiveness check
+    /// makes exactly one hold for every valid value, so each leaf starts from
+    /// its most common constant and muxes in only the arms that differ.
+    /// Otherwise the default is the base, and arms whose leaf equals a
+    /// constant default leaf need no mux: the rest of the chain yields it.
+    pub fn select(
+        builder: &mut Builder,
+        mut arms: Vec<(Tests, Self)>,
+        default_tests: Option<Tests>,
+        default: Self,
+    ) -> Result<Self, Error> {
+        let exhaustive = default_tests.is_some();
+        if let Some(tests) = default_tests {
+            arms.push((tests, default.clone()));
+        }
+        let mut keys = Vec::new();
+        let mut hits = Vec::new();
+        for (tests, value) in &arms {
+            if value.schema != default.schema {
+                return Err(Error("match arm type mismatch".into()));
+            }
+            let mut hit: Option<Self> = None;
+            for (test, key) in tests {
+                keys.push(*key);
+                hit = Some(match hit {
+                    None => test.clone(),
+                    Some(h) => h.binary(builder, Binary::Or, test, true)?,
+                });
+            }
+            hits.push(hit.ok_or_else(|| Error("match arm without a pattern".into()))?);
+        }
+        let mut distinct: Vec<u64> = keys.iter().flatten().copied().collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let exclusive = distinct.len() == keys.len();
+        let one_hot = exclusive && exhaustive;
+        let mut values = Vec::with_capacity(default.values.len());
+        for (leaf, &last) in default.values.iter().enumerate() {
+            let leaves: Vec<NodeId> = arms.iter().map(|(_, v)| v.values[leaf]).collect();
+            // The base: the most common constant (one-hot), else the default.
+            let mut bottom = last;
+            let mut skip = None;
+            if one_hot {
+                let mut best = (0, None);
+                for &node in &leaves {
+                    if let Some(c) = builder.constant_value(node) {
+                        let count = leaves
+                            .iter()
+                            .filter(|&&n| builder.constant_value(n) == Some(c))
+                            .count();
+                        if count > best.0 {
+                            best = (count, Some(node));
+                        }
+                    }
+                }
+                if let (_, Some(node)) = best {
+                    bottom = node;
+                    skip = builder.constant_value(node);
+                }
+            } else if exclusive {
+                skip = builder.constant_value(last);
+            }
+            let mut result = bottom;
+            // With the default among the arms (one-hot), every arm is tested.
+            let tested = if one_hot {
+                leaves.len()
+            } else {
+                leaves.len() - usize::from(exhaustive)
+            };
+            for (hit, &v) in hits.iter().zip(&leaves).take(tested).rev() {
+                if exclusive
+                    && (v == bottom || (skip.is_some() && builder.constant_value(v) == skip))
+                {
+                    continue;
+                }
+                result = builder.mux(hit.scalar()?, v, result)?;
+            }
+            values.push(result);
+        }
+        Ok(Self {
+            schema: default.schema,
+            values,
+        })
+    }
+    /// Whether a data enum value is `variant`: one comparison on its tag.
+    pub fn is_variant(&self, builder: &mut Builder, variant: &str) -> Result<Self, Error> {
+        let (discriminant, _, _) = self.schema.variant_fields(variant)?;
+        let Schema::Tagged { tag, .. } = &self.schema else {
+            unreachable!("variant_fields checked the schema");
+        };
+        let expected = builder.constant(tag.width()?, discriminant)?;
+        Ok(Self {
+            schema: Schema::Bool,
+            values: vec![builder.binary(Binary::Eq, self.values[0], expected)?],
+        })
+    }
+    /// Field `field` of variant `variant` (wires only; meaningful when the
+    /// value is that variant).
+    pub fn variant_field(&self, variant: &str, field: &str) -> Result<Self, Error> {
+        let (_, mut offset, fields) = self.schema.variant_fields(variant)?;
+        for (name, schema) in fields {
+            let count = schema.leaves().len();
+            if name == field {
+                return Ok(Self {
+                    schema: schema.clone(),
+                    values: self.values[offset..offset + count].to_vec(),
+                });
+            }
+            offset += count;
+        }
+        Err(Error(format!("variant {variant} has no field {field}")))
+    }
+    /// A constant `match` pattern test: data enums compare only their tag,
+    /// everything else compares with `==`.
+    pub fn pattern_eq(&self, builder: &mut Builder, pattern: &Self) -> Result<Self, Error> {
+        if matches!(self.schema, Schema::Tagged { .. }) {
+            if self.schema != pattern.schema {
+                return Err(Error("match pattern type mismatch".into()));
+            }
+            return Ok(Self {
+                schema: Schema::Bool,
+                values: vec![builder.binary(Binary::Eq, self.values[0], pattern.values[0])?],
+            });
+        }
+        self.binary(builder, Binary::Eq, pattern, false)
     }
     pub fn require<T: LogicValue>(&self) -> Result<(), Error> {
         if self.schema != T::schema() {
@@ -467,7 +750,7 @@ impl Symbolic {
             Binary::Eq | Binary::Ne | Binary::Lt | Binary::Le | Binary::Gt | Binary::Ge
         );
         match &self.schema {
-            Schema::Struct { .. } | Schema::Array { .. } => {
+            Schema::Struct { .. } | Schema::Array { .. } | Schema::Tagged { .. } => {
                 return self.aggregate_equal(builder, op, rhs);
             }
             Schema::Enum { .. } if !comparison => {
@@ -491,7 +774,8 @@ impl Symbolic {
             values: vec![value],
         })
     }
-    /// `==` / `!=` on structs and arrays: every leaf equal.
+    /// `==` / `!=` on structs, arrays and data enums: every leaf equal
+    /// (inactive variant fields are always zero, so this is Rust's `==`).
     fn aggregate_equal(
         &self,
         builder: &mut Builder,
@@ -499,10 +783,26 @@ impl Symbolic {
         rhs: &Self,
     ) -> Result<Self, Error> {
         if !matches!(op, Binary::Eq | Binary::Ne) {
-            return Err(Error("structs and arrays support only == and !=".into()));
+            return Err(Error(
+                "structs, arrays and enums with fields support only == and !=".into(),
+            ));
         }
+        let pairs: Vec<(NodeId, NodeId)> = match self.known_variant(builder, rhs)? {
+            // Against a value whose variant is known, only the tag and that
+            // variant's fields can differ: other fields are zero on both sides.
+            Some(range) => std::iter::once(0)
+                .chain(range)
+                .map(|i| (self.values[i], rhs.values[i]))
+                .collect(),
+            None => self
+                .values
+                .iter()
+                .copied()
+                .zip(rhs.values.iter().copied())
+                .collect(),
+        };
         let mut all = builder.constant(1, 1)?;
-        for (&a, &b) in self.values.iter().zip(&rhs.values) {
+        for (a, b) in pairs {
             let same = builder.binary(Binary::Eq, a, b)?;
             all = builder.binary(Binary::And, all, same)?;
         }

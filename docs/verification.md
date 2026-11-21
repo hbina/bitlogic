@@ -11,7 +11,7 @@ cargo test --workspace --locked
 make emit example
 ```
 
-The active workspace has 58 tests and 21 doctests (17 compile-fail).
+The active workspace has 73 tests and 24 doctests (19 compile-fail).
 
 The 2026-11-08 audit also reran the 16 historical processor CLI commands,
 the generic mapped and routed processor regressions, Ruff and the physical
@@ -164,7 +164,8 @@ zero-iteration fold bodies, duplicate parameters and generic/non-path calls.
 Fourteen compile-fail doctests cover mutation, references, missing fields,
 incompatible branches, unsupported leaf types, `ir()` on a multi-input helper,
 calls to ordinary Rust functions, reassignment, early return, struct updates,
-tuple structs, run-time `[]` indexing, match guards and enums with fields.
+tuple structs, run-time `[]` indexing and match guards (the enums-with-fields
+case was replaced on 2026-11-21 by nested-pattern and `|`-binding cases).
 Three executable doctests check pure structured native/IR evaluation and HDL
 construction, helper calls over all 256 bytes, and an array/enum register file.
 
@@ -201,8 +202,8 @@ overlapping/unreachable arms, and the enum comments in emitted Verilog.
 Mutations of the run-time read (padding, range check, tree order), `set`
 (constant and run-time paths), aggregate `!=`, enum zero values, wildcard
 handling and arm order were each applied and each made a test fail. Macro unit
-tests and three compile-fail doctests cover rejected forms (run-time `[]`,
-guards, enums with fields, bindings in patterns, duplicate discriminants).
+tests and compile-fail doctests cover rejected forms (run-time `[]`, guards,
+duplicate discriminants; field-carrying enums are now supported, see below).
 Constant folding changes generated netlists, not behavior: the full workspace
 suite, including the 25 processor tests, passes with it, and
 `scripts/processor_migration_equiv.sh` (Yosys 0.70 `equiv_simple`) proves the
@@ -211,6 +212,40 @@ folded processor next-state HDL equivalent to the pre-migration baseline
 
 The [migration audit](pure_functions.md) records baseline and current evidence.
 The integer processor reference and protocol oracle logic are preserved.
+
+## Enums with fields (2026-11-21)
+
+`tests/adts.rs` runs all 592 states of a machine. Its state includes an enum
+with a unit variant, a brace variant, a tuple variant whose field is a sparse
+enum (zero value encoded as 1), and a variant that wraps a struct containing an
+array. The machine's logic constructs every form, matches with bindings,
+renamed fields, `..`, `_` and `|`, compares data-enum values with `==`, and
+passes one through a `#[logic]` call. Native Rust, the IR and Icarus all match
+an oracle written over raw leaf integers. Further tests check:
+
+- the leaf layout, zero value and `flatten`/`read` round trip of all 37 values;
+- that `read` rejects non-canonical inactive fields and invalid discriminants;
+- the tag-encoding comments and port names in the Verilog;
+- run-time `at` reads from a `[Cmd; 3]`, including the out-of-range zero value,
+  in native Rust, the IR and Icarus;
+- a `system!` register holding a data enum, in the cycle model and generated
+  Verilog;
+- rejection of a register whose zero value is not all zero bits;
+- that `<` on data enums is an `ir()` error.
+
+Further tests check the lowering cost:
+
+- `==` against a unit variant builds one comparison; disabling the
+  known-variant shortcut makes it seven, and the test fails;
+- an identity `match` over all four variants builds 9 muxes instead of 13 for a
+  priority chain; disabling one-hot selection makes the test fail;
+- `matches!` with `|` and `..` agrees with native Rust for all 37 values.
+
+Three implementation mutations each made a test fail: inactive fields built as
+0 instead of their zero value, field offsets that ignore the tag leaf, and an
+inverted variant test. Compile-fail doctests cover non-logic field types,
+nested patterns and bindings in `|` alternatives. Macro unit tests cover
+generic and reference-typed variants.
 
 ## Fixed-capacity sets and maps (2026-11-18)
 

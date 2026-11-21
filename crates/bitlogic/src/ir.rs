@@ -449,12 +449,20 @@ impl Builder {
         if !(1..=64).contains(&width) {
             return fail("bit widths must be in 1..=64");
         }
-        // Constant folding: an operation on constants is a constant, and a
-        // mux with a constant condition is the selected operand.
-        if let Operation::Mux { condition, yes, no } = operation
-            && let Some(c) = self.constant_value(condition)
-        {
-            return Ok(if c != 0 { yes } else { no });
+        // Constant folding: an operation on constants is a constant, a mux
+        // with a constant condition is the selected operand, and a mux between
+        // equal operands (one node, or equal constants) is that operand.
+        if let Operation::Mux { condition, yes, no } = operation {
+            if let Some(c) = self.constant_value(condition) {
+                return Ok(if c != 0 { yes } else { no });
+            }
+            if yes == no
+                || self
+                    .constant_value(yes)
+                    .is_some_and(|y| self.constant_value(no) == Some(y))
+            {
+                return Ok(yes);
+            }
         }
         let sources = operands(&operation);
         if !sources.is_empty() && sources.iter().all(|&id| self.constant_value(id).is_some()) {

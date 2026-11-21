@@ -165,10 +165,26 @@
 //! fn guarded(a: bool) -> bool { match a { true if a => false, _ => true } }
 //! ```
 //!
-//! Derived enums must be fieldless:
+//! Variant fields must be logic values:
 //! ```compile_fail
 //! use bitlogic::LogicValue;
-//! #[derive(LogicValue)] enum Tagged { A(bool), B }
+//! #[derive(LogicValue)] enum Tagged { A(u8), B }
+//! ```
+//!
+//! Variant fields bind to plain names; nested patterns are unsupported:
+//! ```compile_fail
+//! use bitlogic::{logic, LogicValue};
+//! #[derive(Clone, Copy, LogicValue)] enum Tagged { A(bool), B }
+//! #[logic]
+//! fn nested(t: Tagged) -> bool { match t { Tagged::A(true) => true, _ => false } }
+//! ```
+//!
+//! Bindings cannot be shared between `|` alternatives:
+//! ```compile_fail
+//! use bitlogic::{logic, LogicValue};
+//! #[derive(Clone, Copy, LogicValue)] enum Tagged { A(bool), B(bool) }
+//! #[logic]
+//! fn either(t: Tagged) -> bool { match t { Tagged::A(x) | Tagged::B(x) => x } }
 //! ```
 //!
 //! Mutation is outside the language:
@@ -263,6 +279,16 @@ pub mod __private {
     pub use crate::value::Symbolic;
     /// Nesting limit for inlined `#[logic]` calls; catches recursion.
     pub const MAX_CALL_DEPTH: usize = 64;
+    /// The schema of the value a constructor expression builds. The closure is
+    /// never called; it lets rustc resolve whether `A::B { .. }` names a struct
+    /// or an enum variant.
+    pub fn schema_of<T: crate::LogicValue>(_: impl FnOnce() -> T) -> crate::Schema {
+        T::schema()
+    }
+    /// A placeholder field value inside a [`schema_of`] closure.
+    pub fn never<T>() -> T {
+        unreachable!("schema probes are never evaluated")
+    }
 }
 pub use ir::{Binary, Builder, Error, Logic, Node, NodeId, Operation, Port};
 use std::ops::{Add, BitAnd, BitOr, BitXor, Not, Shl, Shr, Sub};

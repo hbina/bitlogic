@@ -41,7 +41,8 @@ adapters through ordinary Rust trait resolution. No global registry is used.
 
 Leaves are `bool`, unsigned `Bits<N>` (widths 1 through 64) and fieldless
 enums. Named non-generic structs derive `LogicValue` and may nest other derived
-structs and fixed-length arrays `[T; N]` of any value type. Deriving `Copy`
+structs, [enums with fields](#enums-with-fields) and fixed-length arrays
+`[T; N]` of any value type. Deriving `Copy`
 and `Clone` is useful for native expression reuse. Leaf and struct values can be
 inputs or outputs; the input and output types need not be the same. A circuit (a
 function with `ir()`) groups multiple logical inputs into one struct; helpers
@@ -99,10 +100,66 @@ Generated Verilog names each enum port's encoding in a comment.
 `match` works on a scalar (enum, `Bits` or `bool`) with constant patterns:
 `Enum::Variant` paths, `const` names, `true`/`false`, `|` alternatives and `_`.
 Arms are tried in source order, as in Rust; rustc's exhaustiveness check on the
-native function lets the last arm act as the default. Guards, bindings and
-destructuring are unsupported. Constant expressions are folded while the graph
-is built: an operation on constants is a constant, and a mux with a constant
-condition is the selected value.
+native function lets the last arm act as the default. `matches!(value,
+pattern)` is the same as `match value { pattern => true, _ => false }`. Guards
+are unsupported. Constant expressions are folded while the graph is built: an
+operation on constants is a constant, a mux with a constant condition is the
+selected value, and a mux between equal operands is that operand.
+
+When the arms test distinct constants (distinct variants, or distinct `const`
+or `true`/`false` values), at most one arm can match, and the lowering uses
+that:
+
+- **Last arm with a pattern (not `_`):** exactly one arm matches any valid
+  value. Each result leaf starts from the constant most arms produce and adds a
+  mux only for the arms that differ. A scrutinee with an invalid encoding,
+  which native Rust cannot represent, then gives an unspecified value rather
+  than the last arm's.
+- **Last arm is `_`:** an earlier arm whose leaf equals the `_` arm's constant
+  leaf needs no mux.
+
+Overlapping patterns keep the plain priority chain.
+
+### Enums with fields
+
+An enum with at least one variant that has fields (`Load { addr: Bits<3> }`,
+`Store(Bits<3>, Mode)`) also derives `LogicValue`, with `Schema::Tagged`. It is
+not a leaf. Its leaves are:
+
+- `tag`: the discriminants of all variants, encoded exactly like a fieldless
+  enum, with the same rules for implicit and literal discriminants;
+- then every field of every variant, in declaration order, under
+  `<Variant>.<field>`. Tuple fields are named `0`, `1`, ...
+
+Ports therefore look like `cmd_tag`, `cmd_Load_addr` and `cmd_Store_1`.
+Payloads do not overlap, and there is no niche filling: the value uses the tag
+width plus the width of every field.
+
+The fields of every variant other than the current one hold their zero values
+(zero bits, or the first variant of a fieldless enum). Construction guarantees
+this, `if` and `match` preserve it, and `LogicValue::read` rejects any other
+value. As a result, leaf-by-leaf `==`/`!=` is the same as Rust's derived
+`PartialEq`. Ordering comparisons and bit operations are `ir()` errors. Values
+supplied to generated HDL input ports must follow the same rule, just as a
+fieldless enum port must hold a valid discriminant. The zero value is the first
+variant with zero fields; a `system!` register needs it to be all zero bits.
+
+In `#[logic]` bodies:
+
+- **Construction:** brace variants `Cmd::Load { addr, wide: true }`, tuple
+  variants `Cmd::Store(a, Mode::High)` and unit variants `Cmd::Nop`. Rust's
+  type checker decides whether a brace path names a struct or a variant. A call
+  whose last path segment starts with an uppercase letter is treated as a
+  tuple-variant constructor, which follows Rust naming conventions.
+- **`match` patterns:** `Cmd::Load { addr, wide: w, .. }`, `Cmd::Store(a, _)`,
+  `Cmd::Store(..)` and unit variants, alongside the constant patterns above.
+  Field subpatterns must be plain names or `_`. `..` may only end a tuple
+  pattern. Bindings may not appear in `|` alternatives. A pattern tests only the
+  tag. Bound fields are wires of the scrutinee, and their values only matter
+  when that arm is selected.
+- **Comparisons:** `value == Cmd::Nop`, or `==` with any value whose tag is a
+  constant, compares only the tag and that variant's fields. The other fields
+  are zero on both sides.
 
 ## Fixed-capacity sets and maps
 
@@ -159,7 +216,8 @@ is 1 to 256.
 - Initialized immutable `let` bindings, optional value type annotations, immutable
   shadowing, nested value blocks and a trailing expression.
 - Named field access and complete named struct construction, including qualified
-  type paths and shorthand fields.
+  type paths and shorthand fields; construction of enum variants with fields
+  (see [Enums with fields](#enums-with-fields)).
 - `if`/`else if`/`else` expressions, including whole-struct selection, and
   `match` as described under [Enums](#enums).
 - Arrays, literal and run-time indexing, `set`, array literals and repeats as
@@ -173,11 +231,12 @@ is 1 to 256.
 - Explicit bounded immutable folds as described below.
 
 Mutation, references, assignment statements, compound assignments, early returns,
-struct-update syntax, destructuring, tuples, enums with fields, match guards,
+struct-update syntax, destructuring outside `match`, tuples, nested patterns,
+`if let`, match guards,
 run-time `[]` indexing, calls to non-`#[logic]` functions,
 ordinary loops, async/unsafe functions, and arbitrary leaf types are unsupported.
 `LogicValue` derives require nonempty named non-generic structs or nonempty
-fieldless enums. Rust names are
+non-generic enums. Rust names are
 resolved normally for schemas; recognized DSL operations such as `bits` are
 syntactic and must use the supplied definitions rather than shadowed substitutes.
 Some errors (including dynamic schema validation, flattening name collisions and

@@ -52,7 +52,7 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
     if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
         return Err(error(
             input,
-            "LogicValue requires a non-generic named struct",
+            "LogicValue requires a non-generic named struct or enum",
         ));
     }
     if let syn::Data::Enum(data) = &input.data {
@@ -61,7 +61,7 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
     let syn::Data::Struct(data) = &input.data else {
         return Err(error(
             input,
-            "LogicValue requires a named struct or fieldless enum",
+            "LogicValue requires a named struct or an enum",
         ));
     };
     let syn::Fields::Named(fields) = &data.fields else {
@@ -108,9 +108,6 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
     let mut labels = Vec::new();
     let mut values = Vec::new();
     for variant in &data.variants {
-        if !matches!(variant.fields, syn::Fields::Unit) {
-            return Err(error(variant, "LogicValue enums must be fieldless"));
-        }
         let value = match &variant.discriminant {
             Some((_, expr)) => integer(expr)?,
             None => next,
@@ -125,6 +122,13 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
         labels.push(clean(&variant.ident));
         values.push(value);
     }
+    if !data
+        .variants
+        .iter()
+        .all(|v| matches!(v.fields, syn::Fields::Unit))
+    {
+        return derive_tagged(name, data, &values);
+    }
     Ok(quote! {
         impl ::bitlogic::LogicValue for #name {
             fn schema() -> ::bitlogic::Schema {
@@ -138,6 +142,87 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
                     #(Some(#values) => Ok(Self::#idents),)*
                     _ => Err(::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into())),
                 }
+            }
+        }
+    })
+}
+/// Enums whose variants carry fields: the discriminant leaf, then every
+/// variant's fields, with the fields of inactive variants at their zero value.
+fn derive_tagged(name: &syn::Ident, data: &syn::DataEnum, values: &[u64]) -> syn::Result<Tokens> {
+    let mut schemas = Vec::new();
+    let mut tags = Vec::new();
+    let mut payloads = Vec::new();
+    let mut reads = Vec::new();
+    for (variant, value) in data.variants.iter().zip(values) {
+        let ident = &variant.ident;
+        let label = clean(ident);
+        let types: Vec<_> = variant.fields.iter().map(|f| &f.ty).collect();
+        for ty in &types {
+            value_type(ty)?;
+        }
+        let labels: Vec<_> = match &variant.fields {
+            syn::Fields::Named(f) => f
+                .named
+                .iter()
+                .map(|f| clean(f.ident.as_ref().unwrap()))
+                .collect(),
+            _ => (0..types.len()).map(|i| i.to_string()).collect(),
+        };
+        let locals: Vec<_> = (0..types.len())
+            .map(|i| format_ident!("__field{i}"))
+            .collect();
+        // The variant as a pattern binding `locals`, and as an expression.
+        let shape = match &variant.fields {
+            syn::Fields::Named(f) => {
+                let names = f.named.iter().map(|f| f.ident.as_ref().unwrap());
+                quote!(Self::#ident { #(#names: #locals),* })
+            }
+            syn::Fields::Unnamed(_) => quote!(Self::#ident(#(#locals),*)),
+            syn::Fields::Unit => quote!(Self::#ident),
+        };
+        schemas.push(quote!((#label.into(), #value, ::std::vec![#((#labels.into(), <#types as ::bitlogic::LogicValue>::schema())),*])));
+        let wild = match &variant.fields {
+            syn::Fields::Named(_) => quote!(Self::#ident { .. }),
+            syn::Fields::Unnamed(_) => quote!(Self::#ident(..)),
+            syn::Fields::Unit => quote!(Self::#ident),
+        };
+        tags.push(quote!(#wild => #value));
+        if !types.is_empty() {
+            payloads.push(quote! {
+                match self {
+                    #shape => { #(values.extend(::bitlogic::LogicValue::flatten(#locals));)* }
+                    _ => { #(values.extend(<#types as ::bitlogic::LogicValue>::schema().zero_values());)* }
+                }
+            });
+        }
+        reads.push(if types.is_empty() {
+            quote!(if tag == #value { result = Some(#shape); })
+        } else {
+            quote! {
+                #(let #locals = <#types as ::bitlogic::LogicValue>::read(values)?;)*
+                if tag == #value {
+                    result = Some(#shape);
+                } else if #(::bitlogic::LogicValue::flatten(&#locals) != <#types as ::bitlogic::LogicValue>::schema().zero_values())||* {
+                    return Err(::bitlogic::Error(concat!("non-canonical inactive ", stringify!(#name), " variant fields").into()));
+                }
+            }
+        });
+    }
+    Ok(quote! {
+        impl ::bitlogic::LogicValue for #name {
+            fn schema() -> ::bitlogic::Schema {
+                ::bitlogic::Schema::tagged::<Self>(::std::vec![#(#schemas),*])
+            }
+            fn flatten(&self) -> ::std::vec::Vec<u64> {
+                let mut values = ::std::vec![match self { #(#tags),* }];
+                #(#payloads)*
+                values
+            }
+            fn read(values: &mut impl ::std::iter::Iterator<Item=u64>) -> ::std::result::Result<Self,::bitlogic::Error> {
+                let tag = values.next().ok_or_else(|| ::bitlogic::Error("missing value leaf".into()))?;
+                let mut result = None;
+                #(#reads)*
+                result.ok_or_else(|| ::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into()))
             }
         }
     })
@@ -178,6 +263,18 @@ fn generic_integers(arguments: &PathArguments) -> syn::Result<Vec<u64>> {
 }
 
 type Env = BTreeMap<String, Tokens>;
+/// One `match` arm's pattern state: its emitted tests and the
+/// variant fields it binds.
+struct ArmMatch<'a> {
+    scrutinee: &'a Tokens,
+    /// Each test's hit and the constant it compares against.
+    tests: Vec<(Tokens, Tokens)>,
+    bindings: Vec<(String, Tokens)>,
+}
+/// The variant named by a constructor or pattern path: its last segment.
+fn variant_name(path: &syn::Path) -> String {
+    clean(&path.segments.last().expect("paths have a segment").ident)
+}
 #[derive(Default)]
 struct Lower {
     statements: Vec<Tokens>,
@@ -236,6 +333,19 @@ impl Lower {
         };
         self.expr(expr, &env)
     }
+    /// A struct or variant value; `probe` is a never-run closure building it,
+    /// from which rustc infers the type.
+    fn construct(&mut self, probe: Tokens, variant: &str, fields: Vec<Tokens>) -> Tokens {
+        self.emit(quote! {
+            ::bitlogic::__private::Symbolic::construct(
+                __logic_builder,
+                #[allow(unreachable_code, clippy::diverging_sub_expression)]
+                ::bitlogic::__private::schema_of(#probe),
+                #variant,
+                ::std::vec![#(#fields),*],
+            )?
+        })
+    }
     /// Inline a call to another `#[logic]` function. The callee's macro
     /// expansion provides `<path>::__lower`, which builds its graph into the
     /// caller's builder; the native call is ordinary Rust.
@@ -261,70 +371,93 @@ impl Lower {
         )?)))
     }
     /// `match` on a scalar (enum, `Bits` or `bool`) with constant patterns:
-    /// enum variants, `const`s, `true`/`false`, `|` alternatives and `_`.
-    /// Arms are tried in order; rustc's exhaustiveness check on the native
-    /// function makes the last arm the default.
+    /// enum variants, `const`s, `true`/`false`, `|` alternatives and `_`; on
+    /// an enum with fields also `V { a, b: x, .. }` and `V(a, _)`, whose
+    /// bindings name the variant's fields. Arms are tried in order; rustc's
+    /// exhaustiveness check on the native function makes the last arm the
+    /// default.
     fn matching(&mut self, m: &syn::ExprMatch, env: &Env) -> syn::Result<Tokens> {
         let scrutinee = self.expr(&m.expr, env)?;
         let mut arms = Vec::new();
+        let mut wildcard = false;
         for arm in &m.arms {
             if let Some((r#if, _)) = &arm.guard {
                 return Err(error(r#if, "match guards are not supported"));
             }
-            let mut patterns = Vec::new();
-            let wildcard = self.patterns(&arm.pat, env, &mut patterns)?;
-            let value = self.expr(&arm.body, env)?;
-            arms.push((patterns, wildcard, value));
+            let mut arm_match = ArmMatch {
+                scrutinee: &scrutinee,
+                tests: Vec::new(),
+                bindings: Vec::new(),
+            };
+            wildcard = self.patterns(&arm.pat, env, &mut arm_match)?;
+            let mut inner = env.clone();
+            inner.extend(arm_match.bindings);
+            let value = self.expr(&arm.body, &inner)?;
+            arms.push((arm_match.tests, value));
             if wildcard {
                 break;
             }
         }
-        let Some((_, _, mut result)) = arms.pop() else {
+        let Some((default_tests, default)) = arms.pop() else {
             return Err(error(m, "match needs at least one arm"));
         };
-        for (patterns, _, value) in arms.into_iter().rev() {
-            let mut hit: Option<Tokens> = None;
-            for pattern in patterns {
-                let eq = self.emit(quote!(#scrutinee.binary(__logic_builder,::bitlogic::Binary::Eq,&#pattern,false)?));
-                hit = Some(match hit {
-                    None => eq,
-                    Some(h) => self
-                        .emit(quote!(#h.binary(__logic_builder,::bitlogic::Binary::Or,&#eq,true)?)),
-                });
-            }
-            let hit = hit.expect("arm has a pattern");
-            result = self.emit(
-                quote!(::bitlogic::__private::Symbolic::mux(__logic_builder,&#hit,&#value,&#result)?),
-            );
+        if arms.is_empty() {
+            return Ok(default);
         }
-        Ok(result)
+        // A last arm with patterns is tested too, which lets `select` treat
+        // the arms as one-hot when their tested constants are distinct.
+        let default_tests = if wildcard {
+            quote!(::std::option::Option::None)
+        } else {
+            let tests = default_tests
+                .into_iter()
+                .map(|(hit, key)| quote!((#hit.clone(), #key)));
+            quote!(::std::option::Option::Some(::std::vec![#(#tests),*]))
+        };
+        let arms = arms.into_iter().map(|(tests, value)| {
+            let tests = tests
+                .into_iter()
+                .map(|(hit, key)| quote!((#hit.clone(), #key)));
+            quote!((::std::vec![#(#tests),*], #value.clone()))
+        });
+        Ok(self.emit(quote!({
+            let arms = ::std::vec![#(#arms),*];
+            let default_tests = #default_tests;
+            ::bitlogic::__private::Symbolic::select(__logic_builder, arms, default_tests, #default.clone())?
+        })))
     }
-    /// Collect the constant values of a pattern; true for `_`.
-    fn patterns(&mut self, pat: &Pat, env: &Env, out: &mut Vec<Tokens>) -> syn::Result<bool> {
+    /// Emit the tests of a pattern and collect its bindings; true for `_`.
+    fn patterns(&mut self, pat: &Pat, env: &Env, arm: &mut ArmMatch) -> syn::Result<bool> {
         self.tick(pat)?;
+        let scrutinee = arm.scrutinee;
+        let constant = |lower: &mut Self, arm: &mut ArmMatch, value: Tokens| {
+            {
+                let c = lower.emit(
+                    quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #value)?),
+                );
+                let hit = lower.emit(quote!(#scrutinee.pattern_eq(__logic_builder,&#c)?));
+                arm.tests
+                    .push((hit, quote!(#scrutinee.pattern_key(__logic_builder, &#c))));
+            }
+            Ok(false)
+        };
         match pat {
             Pat::Wild(_) => Ok(true),
             Pat::Or(or) => {
+                let bound = arm.bindings.len();
                 let mut wildcard = false;
                 for case in &or.cases {
-                    wildcard |= self.patterns(case, env, out)?;
+                    wildcard |= self.patterns(case, env, arm)?;
+                }
+                if arm.bindings.len() != bound && or.cases.len() > 1 {
+                    return Err(error(or, "bindings in | alternatives are not supported"));
                 }
                 Ok(wildcard)
             }
-            Pat::Paren(p) => self.patterns(&p.pat, env, out),
-            Pat::Path(p) if p.qself.is_none() => {
-                out.push(
-                    self.emit(
-                        quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #p)?),
-                    ),
-                );
-                Ok(false)
-            }
+            Pat::Paren(p) => self.patterns(&p.pat, env, arm),
+            Pat::Path(p) if p.qself.is_none() => constant(self, arm, quote!(#p)),
             Pat::Lit(lit) if matches!(lit.lit, syn::Lit::Bool(_)) => {
-                out.push(self.emit(
-                    quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #lit)?),
-                ));
-                Ok(false)
+                constant(self, arm, quote!(#lit))
             }
             // A bare name is a `const` (or an imported variant); a binding
             // would be a fresh variable, which the language does not support.
@@ -335,16 +468,74 @@ impl Lower {
                     && !env.contains_key(&clean(&p.ident)) =>
             {
                 let ident = &p.ident;
-                out.push(self.emit(
-                    quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #ident)?),
-                ));
+                constant(self, arm, quote!(#ident))
+            }
+            Pat::Struct(p) if p.qself.is_none() => {
+                let variant = variant_name(&p.path);
+                for field in &p.fields {
+                    let name = match &field.member {
+                        syn::Member::Named(n) => clean(n),
+                        syn::Member::Unnamed(i) => i.index.to_string(),
+                    };
+                    self.bind_field(&field.pat, &variant, &name, arm)?;
+                }
+                self.variant_test(&variant, arm);
+                Ok(false)
+            }
+            Pat::TupleStruct(p) if p.qself.is_none() => {
+                let variant = variant_name(&p.path);
+                for (i, element) in p.elems.iter().enumerate() {
+                    if matches!(element, Pat::Rest(_)) {
+                        if i + 1 != p.elems.len() {
+                            return Err(error(
+                                element,
+                                "use .. only at the end of a tuple variant pattern",
+                            ));
+                        }
+                        continue;
+                    }
+                    self.bind_field(element, &variant, &i.to_string(), arm)?;
+                }
+                self.variant_test(&variant, arm);
                 Ok(false)
             }
             _ => Err(error(
                 pat,
-                "match patterns must be enum variants, consts, true/false, | alternatives or _",
+                "match patterns must be enum variants (with plain field bindings), consts, \
+                 true/false, | alternatives or _",
             )),
         }
+    }
+    fn variant_test(&mut self, variant: &str, arm: &mut ArmMatch) {
+        {
+            let scrutinee = arm.scrutinee;
+            let hit = self.emit(quote!(#scrutinee.is_variant(__logic_builder,#variant)?));
+            arm.tests
+                .push((hit, quote!(#scrutinee.variant_key(#variant))));
+        }
+    }
+    /// A field subpattern: `_`, or a plain name bound to the field's wires.
+    fn bind_field(
+        &mut self,
+        pat: &Pat,
+        variant: &str,
+        field: &str,
+        arm: &mut ArmMatch,
+    ) -> syn::Result<()> {
+        if matches!(pat, Pat::Wild(_)) {
+            return Ok(());
+        }
+        if !matches!(pat, Pat::Ident(_)) {
+            return Err(error(
+                pat,
+                "variant fields must be bound to a plain name or _; nested patterns are not supported",
+            ));
+        }
+        let name = immutable_binding(pat)?;
+        let scrutinee = arm.scrutinee;
+        let value = self.emit(quote!(#scrutinee.variant_field(#variant,#field)?));
+        arm.bindings.push((clean(name), value));
+        Ok(())
     }
     fn expr(&mut self, expr: &Expr, env: &Env) -> syn::Result<Tokens> {
         self.tick(expr)?;
@@ -392,6 +583,22 @@ impl Lower {
                 Ok(self.emit(quote!(#value.repeat(#len)?)))
             }
             Expr::Match(m) => self.matching(m, env),
+            // `matches!(value, pattern)` is `match value { pattern => true, _ => false }`.
+            Expr::Macro(m) if m.mac.path.is_ident("matches") => {
+                let (value, pattern) =
+                    m.mac.parse_body_with(|input: syn::parse::ParseStream| {
+                        let value: Expr = input.parse()?;
+                        input.parse::<syn::Token![,]>()?;
+                        let pattern = Pat::parse_multi_with_leading_vert(input)?;
+                        if input.peek(syn::Token![if]) {
+                            return Err(input.error("matches! guards are not supported"));
+                        }
+                        let _: Option<syn::Token![,]> = input.parse()?;
+                        Ok((value, pattern))
+                    })?;
+                let lowered: syn::ExprMatch = syn::parse_quote_spanned!(m.span()=> match #value { #pattern => true, _ => false });
+                self.matching(&lowered, env)
+            }
             Expr::Field(f) => {
                 let base = self.expr(&f.base, env)?;
                 let syn::Member::Named(field) = &f.member else {
@@ -400,20 +607,22 @@ impl Lower {
                 let name = clean(field);
                 Ok(self.emit(quote!(#base.field(#name)?)))
             }
+            // `A::B { .. }` is a struct or an enum variant; rustc resolves which.
             Expr::Struct(s) if s.rest.is_none() && s.qself.is_none() => {
                 let mut fields = Vec::new();
+                let mut members = Vec::new();
                 for field in &s.fields {
-                    let syn::Member::Named(name) = &field.member else {
-                        return Err(error(field, "use named struct fields"));
+                    let name = match &field.member {
+                        syn::Member::Named(name) => clean(name),
+                        syn::Member::Unnamed(i) => i.index.to_string(),
                     };
-                    let name = clean(name);
                     let value = self.expr(&field.expr, env)?;
                     fields.push(quote!((#name, #value.clone())));
+                    members.push(&field.member);
                 }
-                let ty = &s.path;
-                Ok(self.emit(
-                    quote!(::bitlogic::__private::Symbolic::structure::<#ty>(vec![#(#fields),*])?),
-                ))
+                let path = &s.path;
+                let probe = quote!(|| #path { #(#members: ::bitlogic::__private::never()),* });
+                Ok(self.construct(probe, &variant_name(path), fields))
             }
             Expr::Lit(lit) if matches!(lit.lit, syn::Lit::Bool(_)) => Ok(self
                 .emit(quote!(::bitlogic::__private::Symbolic::constant(__logic_builder, #lit)?))),
@@ -461,6 +670,27 @@ impl Lower {
                     return Err(error(call, "call #[logic] functions by plain path"));
                 }
                 let last = path.path.segments.last().unwrap();
+                // By Rust naming convention an uppercase callee is a tuple
+                // variant constructor; #[logic] functions are snake_case.
+                if last
+                    .ident
+                    .to_string()
+                    .starts_with(|c: char| c.is_ascii_uppercase())
+                {
+                    let mut fields = Vec::new();
+                    for (i, arg) in call.args.iter().enumerate() {
+                        let value = self.expr(arg, env)?;
+                        let name = i.to_string();
+                        fields.push(quote!((#name, #value.clone())));
+                    }
+                    let nevers = call
+                        .args
+                        .iter()
+                        .map(|_| quote!(::bitlogic::__private::never()));
+                    let callee = &path.path;
+                    let probe = quote!(|| #callee(#(#nevers),*));
+                    return Ok(self.construct(probe, &variant_name(callee), fields));
+                }
                 if last.ident != "bits" {
                     return self.call(call, &path.path, env);
                 }
@@ -759,8 +989,9 @@ mod tests {
     #[test]
     fn rejects_unsupported_enums() {
         for (source, message) in [
-            ("enum E { A(bool) }", "fieldless"),
-            ("enum E { A { x: bool } }", "fieldless"),
+            ("enum E<T> { A(T) }", "non-generic"),
+            ("enum E { A(&'static bool) }", "logic values must be"),
+            ("enum E { A { x: (bool, bool) } }", "logic values must be"),
             ("enum E {}", "at least one variant"),
             ("enum E { A = 1, B = 1 }", "duplicate"),
             ("enum E { A = 1, B = 0, C }", "duplicate"),
@@ -768,6 +999,15 @@ mod tests {
         ] {
             let err = derive_value(syn::parse_str(source).unwrap()).unwrap_err();
             assert!(err.to_string().contains(message), "{source}: {err}");
+        }
+        for source in [
+            "enum E { A(bool), B { x: Bits<2> }, C }",
+            "enum E { A {}, B() }",
+        ] {
+            assert!(
+                derive_value(syn::parse_str(source).unwrap()).is_ok(),
+                "{source}"
+            );
         }
     }
 }

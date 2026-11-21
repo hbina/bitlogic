@@ -1,6 +1,6 @@
 # Bitlogic
 
-**Last updated: 2026-11-19.** An untimed Rust DSL for pure bit-vector
+**Last updated: 2026-11-21.** An untimed Rust DSL for pure bit-vector
 transformations: `F: Input -> Output`. Write immutable expressions and return a
 complete struct, capture a typed expression graph, then interpret it or emit
 combinational Verilog. The native function remains callable. `system!`
@@ -100,13 +100,13 @@ outputs match the pre-migration HDL.
 
 | Feature | Status | Evidence/scope |
 |---|---|---|
-| Rust frontend | Partial | Immutable owned input/output values, nested structs, fixed-length arrays (literal and run-time `at`/`set` indexing), fieldless enums with `match`, `const` and variant paths, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, 2,000 array requests and all 768 states of an enum machine against integer oracles; documented subset |
+| Rust frontend | Partial | Immutable owned input/output values, nested structs, fixed-length arrays (literal and run-time `at`/`set` indexing), fieldless enums and [enums with fields](docs/bitlogic.md#enums-with-fields) (construction and `match` with field bindings), `const` and variant paths, value conditionals, bounded folds and inlined calls between `#[logic]` functions (any arity); native/IR/Icarus agreement over all 256 inputs of a call test, 2,000 array requests, all 768 states of an enum machine and all 592 states of a data-enum machine against integer oracles; documented subset |
 | Fixed-capacity sets and maps | Verified | `fixed_set!`/`fixed_map!` generate a container module (find, contains, get, insert, update, remove, count, store) for any key/value type and capacity 1..=256; 3,000-step random sequences on a 43-bit-key set (5 slots) and a struct-keyed map (4 slots) match an independent slot model in native Rust, the IR and Icarus; nine macro mutations caught; widths checked at capacities 1, 4, 5 and 256 |
 | Clocked systems (`system!`) | Verified | One declaration of params, registered/unregistered inputs, RAMs, ROMs, units and outputs generates a typed cycle model (`clock`, `reset`) and Verilog (core, unit wrappers, ROMs, RAM); `tests/system.rs`: a producer/consumer pair through a RAM plus a ROM matches an independent integer model and the IR for 3,000 cycles and Icarus for 1,500 cycles, including mid-run resets and same-address read/write collisions; 20 rejected declarations; seven injected backend/macro bugs caught, two unobservable after reset; replaces arty_ethernet's hand-written core with identical outputs (see [verification](docs/verification.md#clocked-systems-2026-11-19)) |
-| Constant folding | Verified | Operations on constants become constants and constant-condition muxes disappear while graphs are built; constant array indexes build no muxes (tests/arrays.rs); full workspace suite including 25 processor tests passes unchanged, and Yosys proves the folded processor HDL equivalent to the pre-migration baseline (122/122 cells) |
+| Constant folding | Verified | Operations on constants become constants, constant-condition and equal-operand muxes disappear, and `match`es over distinct constants mux only arms that differ, while graphs are built (tests/adts.rs node counts); constant array indexes build no muxes (tests/arrays.rs); full workspace suite including 25 processor tests passes unchanged, and Yosys proves the folded processor HDL equivalent to the pre-migration baseline (122/122 cells) |
 | Bit-vector IR and composition | Verified | Independent truth tables, all eleven three-bit binary operations, composition identities, port-shape/value errors, and width boundaries in integration tests |
 | Combinational Verilog | Partial | Icarus checks 128 conditional-transform combinations and 2,725 operator/boundary cases; no synthesis or board evidence |
-| Pure structured interfaces | Verified | Six structured integration tests, schema round trips, nominal composition laws, dependency expectations, and seventeen compile-fail examples; complete returned values |
+| Pure structured interfaces | Verified | Six structured integration tests, schema round trips, nominal composition laws, dependency expectations, and nineteen compile-fail examples; complete returned values |
 | Bounded set example | Verified | Native Rust, IR, and Icarus match a `BTreeSet` oracle for all 8,192 state/key/operation combinations; eight-key universe, caller-owned storage |
 | Fixed-width CRC example | Verified | `cargo test --locked -p bitlogic --example crc`: native Rust, IR and generated HDL under Icarus match independent polynomial division for 4,131 four-byte messages, including every single-bit input; finite functional evidence |
 | Example artifact export | Verified | All four examples emit Verilog, SVG and full Mermaid graphs into unique persistent `/tmp` directories; bundle connectivity test and Icarus elaboration of exported modules/wrappers |
@@ -122,7 +122,7 @@ outputs match the pre-migration HDL.
 | Generic synthesis | Verified | Yosys 0.70: 2,165 generic logic cells + 122 flops; structural check and complete mapped processor regression pass; no technology area/timing claim |
 | SKY130 HD block implementation | Partial | Fresh migrated RTL at TT/25 °C/1.8 V: 15,713.8 µm² cell area, +10.3544 ns setup / +0.253807 ns hold slack at 20 ns; router DRC/antenna zero, constraint audit and routed regression pass; no chip signoff |
 
-`cargo test --workspace --locked`: **63 tests and 22 doctests pass** (17 compile-fail).
+`cargo test --workspace --locked`: **73 tests and 24 doctests pass** (19 compile-fail).
 `cargo fmt --all --check`, Clippy with warnings denied, and `make emit example`
 pass locally. CI runs the same Rust and HDL checks; no remote execution is claimed.
 Exact scope is in [verification](docs/verification.md).
@@ -160,6 +160,7 @@ examples export artifacts without arguments; protocol builders and execution che
 - [x] Measure generic synthesis and rerun the processor regression on mapped HDL.
 - [x] Select SKY130 HD, define block memory/IO/clock constraints, and verify a routed TT-corner implementation study.
 - [x] Replace mutable ports with pure structured functions, derived schemas, typed composition and dependency inspection.
+- [x] Add enums with fields (tag plus per-variant leaves), variant construction and `match` bindings.
 - [ ] Extend the supported Rust subset and composition ergonomics.
 - [x] Prove migrated processor next-state HDL equivalent to the pre-migration implementation.
 - [ ] Extend formal checking to frontend semantics and add optimization passes.
@@ -169,11 +170,18 @@ examples export artifacts without arguments; protocol builders and execution che
 
 A circuit has one owned input and one complete output; helpers called from other
 `#[logic]` functions may take several. Values are `bool`, unsigned
-`Bits<1..=64>`, fieldless enums, fixed-length arrays, and nested non-generic named
-structs deriving `LogicValue`. Mutation, references, calls to ordinary Rust
-functions, early returns, struct-update shorthand, ordinary loops, tuples, enums
-with fields, match guards and bindings, run-time `[]` indexing and arbitrary leaf
-types are unsupported. Run-time array reads past the end return the zero value.
+`Bits<1..=64>`, non-generic enums (fieldless, or with fields), fixed-length arrays,
+and nested non-generic named structs deriving `LogicValue`. Enums with fields give
+every variant its own leaves (no overlapping payloads or niche filling); inactive
+fields must hold their zero values, including on HDL input ports. Their `match`
+patterns bind fields to plain names only (no nested patterns or bindings in `|`
+alternatives), and a call is a tuple-variant constructor exactly when its last path
+segment starts with an uppercase letter. A `match` over distinct variants or
+constants whose last arm has a pattern assumes a valid scrutinee: an invalid enum
+encoding (impossible in native Rust) selects an unspecified value, not the last arm. Mutation, references, calls to ordinary
+Rust functions, early returns, struct-update shorthand, ordinary loops, tuples,
+`if let`, match guards, run-time `[]` indexing and arbitrary leaf types are
+unsupported. Run-time array reads past the end return the zero value.
 `fixed_set!`/`fixed_map!` containers hold at most 256 entries, use only
 combinational logic (cost grows linearly with capacity), and are generated per
 key/value/capacity rather than generic.
