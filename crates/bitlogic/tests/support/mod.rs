@@ -1,10 +1,32 @@
 //! Icarus Verilog check for generated modules: apply each case's input leaf
 #![allow(dead_code)]
 //! values to the ports and compare every output port.
-use bitlogic::Logic;
+use bitlogic::{BitVec, Logic};
 use std::{fmt::Write, process::Command};
 
-pub fn check_hdl(ir: &Logic, module: &str, cases: &[(Vec<u64>, Vec<u64>)]) {
+/// Leaf values as `u64`s, for integer oracles (each leaf at most 64 bits).
+pub fn raw(values: &[BitVec]) -> Vec<u64> {
+    values
+        .iter()
+        .map(|v| v.to_u64().expect("leaf fits a u64"))
+        .collect()
+}
+
+/// Cases are `(inputs, outputs)` port values, as `u64`s or `BitVec`s.
+pub fn check_hdl<A, B>(ir: &Logic, module: &str, cases: &[(Vec<A>, Vec<B>)])
+where
+    A: Clone + Into<BitVec>,
+    B: Clone + Into<BitVec>,
+{
+    let cases: Vec<(Vec<BitVec>, Vec<BitVec>)> = cases
+        .iter()
+        .map(|(i, o)| {
+            (
+                i.iter().cloned().map(Into::into).collect(),
+                o.iter().cloned().map(Into::into).collect(),
+            )
+        })
+        .collect();
     let mut source = ir.to_verilog(module).unwrap();
     source.push_str("module tb;\n");
     for p in ir.inputs() {

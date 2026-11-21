@@ -1,11 +1,11 @@
 //! Structured values and the symbolic values used by generated frontend code.
-use crate::{Binary, Bits, Builder, Error, NodeId, bits};
+use crate::{Binary, BitVec, Bits, Builder, Error, MAX_WIDTH, NodeId, Storage, Width, bits};
 use std::any::{TypeId, type_name};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Schema {
     Bool,
-    Bits(u8),
+    Bits(u16),
     Struct {
         identity: TypeId,
         name: &'static str,
@@ -21,7 +21,7 @@ pub enum Schema {
     Enum {
         identity: TypeId,
         name: &'static str,
-        width: u8,
+        width: u16,
         variants: Vec<(String, u64)>,
     },
     /// An enum whose variants carry fields. Leaves are the `tag` (a
@@ -37,7 +37,7 @@ pub enum Schema {
 }
 
 /// A `match` arm's tests: each hit and the constant it compares against.
-type Tests = Vec<(Symbolic, Option<u64>)>;
+type Tests = Vec<(Symbolic, Option<BitVec>)>;
 
 /// Named field schemas of a struct-like enum variant.
 pub type Fields = Vec<(String, Schema)>;
@@ -61,7 +61,7 @@ impl Schema {
     /// Schema of a fieldless enum with the given `(variant, discriminant)`s.
     pub fn enumeration<T: 'static>(variants: Vec<(String, u64)>) -> Self {
         let largest = variants.iter().map(|(_, v)| *v).max().unwrap_or(0);
-        let width = (64 - largest.leading_zeros()).max(1) as u8;
+        let width = (64 - largest.leading_zeros()).max(1) as u16;
         Self::Enum {
             identity: TypeId::of::<T>(),
             name: type_name::<T>(),
@@ -146,23 +146,27 @@ impl Schema {
         result
     }
 
-    pub fn width(&self) -> Result<u8, Error> {
+    pub fn width(&self) -> Result<u16, Error> {
         match self {
             Self::Bool => Ok(1),
-            Self::Bits(n) if (1..=64).contains(n) => Ok(*n),
+            Self::Bits(n) if (1..=MAX_WIDTH).contains(n) => Ok(*n),
             Self::Enum { width, .. } => Ok(*width),
-            _ => Err(Error("expected bool, Bits<1..=64> or enum leaf".into())),
+            _ => Err(Error(format!(
+                "expected bool, Bits<1..={MAX_WIDTH}> or enum leaf"
+            ))),
         }
     }
 
     /// Leaf values of the zero value: all bits clear, except that enums take
     /// their first variant.
-    pub fn zero_values(&self) -> Vec<u64> {
+    pub fn zero_values(&self) -> Vec<BitVec> {
         self.leaves()
             .iter()
             .map(|(_, leaf)| match leaf {
-                Self::Enum { variants, .. } => variants.first().map_or(0, |(_, v)| *v),
-                _ => 0,
+                Self::Enum { variants, .. } => {
+                    BitVec::from(variants.first().map_or(0, |(_, v)| *v))
+                }
+                _ => BitVec::zero(),
             })
             .collect()
     }
@@ -180,14 +184,17 @@ impl Schema {
     }
 }
 
-/// Native aggregate layout. Derive this trait for named, non-generic structs.
+/// Native aggregate layout. Derive this trait for named, non-generic structs
+/// and enums.
 pub trait LogicValue: Sized + 'static {
     fn schema() -> Schema;
-    fn flatten(&self) -> Vec<u64>;
-    fn read(values: &mut impl Iterator<Item = u64>) -> Result<Self, Error>;
+    /// Leaf values in schema leaf order.
+    fn flatten(&self) -> Vec<BitVec>;
+    fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error>;
 
-    fn from_values(values: &[u64]) -> Result<Self, Error> {
-        let mut values = values.iter().copied();
+    /// The value of leaf values in schema leaf order (`u64`s or [`BitVec`]s).
+    fn from_values<V: Clone + Into<BitVec>>(values: &[V]) -> Result<Self, Error> {
+        let mut values = values.iter().cloned().map(Into::into);
         let value = Self::read(&mut values)?;
         if values.next().is_some() {
             return Err(Error("too many value leaves".into()));
@@ -201,6 +208,16 @@ pub trait LogicValue: Sized + 'static {
         Self::from_values(&Self::schema().zero_values()).expect("zero value is valid")
     }
 
+    /// The value as a `u64` when it is a single leaf that fits one (memory
+    /// addresses in cycle models). Scalars override this to avoid flattening.
+    #[doc(hidden)]
+    fn as_index(&self) -> Option<u64> {
+        match self.flatten().as_slice() {
+            [leaf] => leaf.to_u64(),
+            _ => None,
+        }
+    }
+
     /// Unroll a bounded pure recurrence. The index is 0 through N-1.
     fn fold<const N: usize>(self, f: impl Fn(Self, Bits<8>) -> Self) -> Self {
         assert!(N <= 256, "fold is limited to 256 iterations");
@@ -212,11 +229,14 @@ impl LogicValue for bool {
     fn schema() -> Schema {
         Schema::Bool
     }
-    fn flatten(&self) -> Vec<u64> {
-        vec![u64::from(*self)]
+    fn flatten(&self) -> Vec<BitVec> {
+        vec![BitVec::from(*self)]
     }
-    fn read(values: &mut impl Iterator<Item = u64>) -> Result<Self, Error> {
-        match values.next() {
+    fn as_index(&self) -> Option<u64> {
+        Some(u64::from(*self))
+    }
+    fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error> {
+        match values.next().and_then(|v| v.to_u64()) {
             Some(0) => Ok(false),
             Some(1) => Ok(true),
             _ => Err(Error("expected boolean value leaf".into())),
@@ -224,22 +244,24 @@ impl LogicValue for bool {
     }
 }
 
-impl<const N: usize> LogicValue for Bits<N> {
+impl<const N: usize> LogicValue for Bits<N>
+where
+    Width<N>: Storage,
+{
     fn schema() -> Schema {
-        Schema::Bits(u8::try_from(N).unwrap_or(0))
+        Schema::Bits(u16::try_from(N).unwrap_or(0))
     }
-    fn flatten(&self) -> Vec<u64> {
-        vec![self.get()]
+    fn flatten(&self) -> Vec<BitVec> {
+        vec![self.to_bitvec()]
     }
-    fn read(values: &mut impl Iterator<Item = u64>) -> Result<Self, Error> {
-        let width = Self::schema().width()?;
+    fn as_index(&self) -> Option<u64> {
+        self.to_u64()
+    }
+    fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error> {
         let value = values
             .next()
             .ok_or_else(|| Error("missing value leaf".into()))?;
-        if value & !(u64::MAX >> (64 - width)) != 0 {
-            return Err(Error("value exceeds leaf width".into()));
-        }
-        Ok(bits(value))
+        Self::from_bitvec(&value).ok_or_else(|| Error("value exceeds leaf width".into()))
     }
 }
 
@@ -247,10 +269,10 @@ impl<T: LogicValue, const N: usize> LogicValue for [T; N] {
     fn schema() -> Schema {
         Schema::array::<T>(N)
     }
-    fn flatten(&self) -> Vec<u64> {
+    fn flatten(&self) -> Vec<BitVec> {
         self.iter().flat_map(LogicValue::flatten).collect()
     }
-    fn read(values: &mut impl Iterator<Item = u64>) -> Result<Self, Error> {
+    fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error> {
         let elements = (0..N)
             .map(|_| T::read(values))
             .collect::<Result<Vec<_>, _>>()?;
@@ -266,25 +288,39 @@ impl<T: LogicValue, const N: usize> LogicValue for [T; N] {
 pub trait LogicArray: Sized {
     type Element;
     /// Element `index`, or the zero value when `index` is out of range.
-    fn at<const K: usize>(&self, index: Bits<K>) -> Self::Element;
+    fn at<const K: usize>(&self, index: Bits<K>) -> Self::Element
+    where
+        Width<K>: Storage;
     /// A copy with element `index` replaced (unchanged when out of range).
-    fn set<const K: usize>(self, index: Bits<K>, value: Self::Element) -> Self;
+    fn set<const K: usize>(self, index: Bits<K>, value: Self::Element) -> Self
+    where
+        Width<K>: Storage;
+}
+
+/// A run-time index as a `usize`, if it is one.
+fn position<const K: usize>(index: Bits<K>) -> Option<usize>
+where
+    Width<K>: Storage,
+{
+    index.to_u64().and_then(|i| usize::try_from(i).ok())
 }
 
 impl<T: LogicValue + Clone, const N: usize> LogicArray for [T; N] {
     type Element = T;
-    fn at<const K: usize>(&self, index: Bits<K>) -> T {
-        usize::try_from(index.get())
-            .ok()
+    fn at<const K: usize>(&self, index: Bits<K>) -> T
+    where
+        Width<K>: Storage,
+    {
+        position(index)
             .and_then(|i| self.get(i))
             .cloned()
             .unwrap_or_else(T::zeroed)
     }
-    fn set<const K: usize>(mut self, index: Bits<K>, value: T) -> Self {
-        if let Some(slot) = usize::try_from(index.get())
-            .ok()
-            .and_then(|i| self.get_mut(i))
-        {
+    fn set<const K: usize>(mut self, index: Bits<K>, value: T) -> Self
+    where
+        Width<K>: Storage,
+    {
+        if let Some(slot) = position(index).and_then(|i| self.get_mut(i)) {
             *slot = value;
         }
         self
@@ -312,12 +348,16 @@ impl Symbolic {
     pub fn constant<T: LogicValue>(builder: &mut Builder, value: T) -> Result<Self, Error> {
         Self::from_leaves(builder, T::schema(), &value.flatten())
     }
-    fn from_leaves(builder: &mut Builder, schema: Schema, leaves: &[u64]) -> Result<Self, Error> {
+    fn from_leaves(
+        builder: &mut Builder,
+        schema: Schema,
+        leaves: &[BitVec],
+    ) -> Result<Self, Error> {
         let values = schema
             .leaves()
             .iter()
             .zip(leaves)
-            .map(|((_, leaf), &value)| builder.constant(leaf.width()?, value))
+            .map(|((_, leaf), value)| builder.constant(leaf.width()?, value))
             .collect::<Result<_, _>>()?;
         Ok(Self { schema, values })
     }
@@ -364,12 +404,17 @@ impl Symbolic {
         Self::array(vec![self.clone(); len])
     }
     /// The run-time index as `(node, width)`, and its value if constant.
-    fn index_node(&self, builder: &Builder) -> Result<(NodeId, u8, Option<u64>), Error> {
+    /// A constant index is `Some(position)`, `Some(None)` when it does not
+    /// fit a `usize` (out of range).
+    fn index_node(&self, builder: &Builder) -> Result<(NodeId, u16, Option<Option<usize>>), Error> {
         let Schema::Bits(width) = self.schema else {
             return Err(Error("array indexes must be Bits<N>".into()));
         };
         let node = self.scalar()?;
-        Ok((node, width, builder.constant_value(node)))
+        let constant = builder
+            .constant_value(node)
+            .map(|c| c.to_u64().and_then(|i| usize::try_from(i).ok()));
+        Ok((node, width, constant))
     }
     /// Element `index` of an array, or the zero value when out of range
     /// (`LogicArray::at`). A constant index selects without logic.
@@ -378,8 +423,8 @@ impl Symbolic {
         let element = element.clone();
         let (node, width, constant) = index.index_node(builder)?;
         if let Some(i) = constant {
-            return match usize::try_from(i) {
-                Ok(i) if i < len => self.element(i),
+            return match i {
+                Some(i) if i < len => self.element(i),
                 _ => Self::zero(builder, &element),
             };
         }
@@ -399,7 +444,7 @@ impl Symbolic {
         for level in 0..levels {
             let bit = Self {
                 schema: Schema::Bool,
-                values: vec![builder.slice(node, level as u8, 1)?],
+                values: vec![builder.slice(node, level as u16, 1)?],
             };
             layer = layer
                 .chunks(2)
@@ -411,8 +456,8 @@ impl Symbolic {
         if u32::from(width) == levels {
             return Ok(selected);
         }
-        let high_width = width - levels as u8;
-        let high = builder.slice(node, levels as u8, high_width)?;
+        let high_width = width - levels as u16;
+        let high = builder.slice(node, levels as u16, high_width)?;
         let none = builder.constant(high_width, 0)?;
         let in_range = Self {
             schema: Schema::Bool,
@@ -436,7 +481,7 @@ impl Symbolic {
         for i in 0..len {
             let old = self.element(i)?;
             let new = match constant {
-                Some(c) if c == i as u64 => value.clone(),
+                Some(c) if c == Some(i) => value.clone(),
                 Some(_) => old,
                 None if i < reachable => {
                     let at = builder.constant(width, i as u64)?;
@@ -527,7 +572,7 @@ impl Symbolic {
                     values.push(if (offset..offset + payload.len()).contains(&i) {
                         payload[i - offset]
                     } else {
-                        builder.constant(leaf.width()?, zeros[i])?
+                        builder.constant(leaf.width()?, &zeros[i])?
                     });
                 }
                 Ok(Self { schema, values })
@@ -559,7 +604,7 @@ impl Symbolic {
         let Some(((name, fields), _)) = payloads
             .iter()
             .zip(variants)
-            .find(|(_, (_, v))| *v == value)
+            .find(|(_, (_, v))| *value == *v)
         else {
             return Ok(None);
         };
@@ -569,18 +614,19 @@ impl Symbolic {
     }
     /// The constant a pattern tests: a scalar pattern's value, or a data
     /// enum pattern's tag.
-    pub fn pattern_key(&self, builder: &Builder, pattern: &Self) -> Option<u64> {
+    pub fn pattern_key(&self, builder: &Builder, pattern: &Self) -> Option<BitVec> {
         pattern
             .values
             .first()
             .and_then(|&node| builder.constant_value(node))
+            .cloned()
     }
     /// The tag a variant pattern tests.
-    pub fn variant_key(&self, variant: &str) -> Option<u64> {
+    pub fn variant_key(&self, variant: &str) -> Option<BitVec> {
         self.schema
             .variant_fields(variant)
             .ok()
-            .map(|(tag, _, _)| tag)
+            .map(|(tag, _, _)| BitVec::from(tag))
     }
     /// A `match`: each arm's tests `(hit, tested constant)` and value, tried
     /// in order; the last arm is the default, and its tests are given when it
@@ -610,7 +656,7 @@ impl Symbolic {
             }
             let mut hit: Option<Self> = None;
             for (test, key) in tests {
-                keys.push(*key);
+                keys.push(key.clone());
                 hit = Some(match hit {
                     None => test.clone(),
                     Some(h) => h.binary(builder, Binary::Or, test, true)?,
@@ -618,7 +664,7 @@ impl Symbolic {
             }
             hits.push(hit.ok_or_else(|| Error("match arm without a pattern".into()))?);
         }
-        let mut distinct: Vec<u64> = keys.iter().flatten().copied().collect();
+        let mut distinct: Vec<&BitVec> = keys.iter().flatten().collect();
         distinct.sort_unstable();
         distinct.dedup();
         let exclusive = distinct.len() == keys.len();
@@ -644,10 +690,10 @@ impl Symbolic {
                 }
                 if let (_, Some(node)) = best {
                     bottom = node;
-                    skip = builder.constant_value(node);
+                    skip = builder.constant_value(node).cloned();
                 }
             } else if exclusive {
-                skip = builder.constant_value(last);
+                skip = builder.constant_value(last).cloned();
             }
             let mut result = bottom;
             // With the default among the arms (one-hot), every arm is tested.
@@ -658,7 +704,8 @@ impl Symbolic {
             };
             for (hit, &v) in hits.iter().zip(&leaves).take(tested).rev() {
                 if exclusive
-                    && (v == bottom || (skip.is_some() && builder.constant_value(v) == skip))
+                    && (v == bottom
+                        || (skip.is_some() && builder.constant_value(v) == skip.as_ref()))
                 {
                     continue;
                 }
@@ -847,8 +894,8 @@ impl Symbolic {
     pub fn slice(
         &self,
         builder: &mut Builder,
-        offset: u8,
-        width: u8,
+        offset: u16,
+        width: u16,
         bit: bool,
     ) -> Result<Self, Error> {
         if !matches!(self.schema, Schema::Bits(_)) {
@@ -867,13 +914,13 @@ impl Symbolic {
         &self,
         builder: &mut Builder,
         rhs: &Self,
-        low: u8,
-        total: u8,
+        low: u16,
+        total: u16,
     ) -> Result<Self, Error> {
         let Schema::Bits(high) = self.schema else {
             return Err(Error("concat requires Bits<N>".into()));
         };
-        if rhs.schema != Schema::Bits(low) || u16::from(high) + u16::from(low) != u16::from(total) {
+        if rhs.schema != Schema::Bits(low) || u32::from(high) + u32::from(low) != u32::from(total) {
             return Err(Error("concatenation width mismatch".into()));
         }
         Ok(Self {

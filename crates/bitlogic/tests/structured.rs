@@ -129,7 +129,15 @@ fn nested_schema_round_trip_and_validation() {
     ] {
         assert!(Input::from_values(&invalid).is_err(), "{invalid:?}");
     }
-    assert!(Bits::<65>::from_values(&[0]).is_err());
+    // A 65-bit leaf holds bit 64 but not bit 65.
+    let top = bitlogic::BitVec::from_words(&[0, 1]);
+    assert_eq!(
+        Bits::<65>::from_values(std::slice::from_ref(&top))
+            .unwrap()
+            .flatten(),
+        [top]
+    );
+    assert!(Bits::<65>::from_values(&[bitlogic::BitVec::from_words(&[0, 2])]).is_err());
     #[derive(Clone, Copy, LogicValue)]
     struct Raw {
         r#type: bool,

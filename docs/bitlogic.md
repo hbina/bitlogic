@@ -39,7 +39,7 @@ adapters through ordinary Rust trait resolution. No global registry is used.
 
 ## Values and complete results
 
-Leaves are `bool`, unsigned `Bits<N>` (widths 1 through 64) and fieldless
+Leaves are `bool`, unsigned `Bits<N>` (widths 1 through 4096) and fieldless
 enums. Named non-generic structs derive `LogicValue` and may nest other derived
 structs, [enums with fields](#enums-with-fields) and fixed-length arrays
 `[T; N]` of any value type. Deriving `Copy`
@@ -48,9 +48,14 @@ inputs or outputs; the input and output types need not be the same. A circuit (a
 function with `ir()`) groups multiple logical inputs into one struct; helpers
 called from other `#[logic]` functions may take several arguments.
 
-`bits::<N>(value)` masks its literal to N bits. Addition/subtraction wrap at N bits
-in every build profile. Comparisons are unsigned; shifts that shift all bits out
-return zero, including shift counts >=64. `bool` and `Bits<1>` have different
+`bits::<N>(value)` takes a `u64`, masked to N bits (zero-extended when N > 64).
+`Bits<N>` is stored as `⌈N/64⌉` little-endian words: `words()` and
+`from_words()` reach every bit, `to_u64()` returns the value when it fits, and
+`get()` returns it as a `u64` only for N ≤ 64 (otherwise a compile-time error).
+Generic code over a width states `where Width<N>: Storage`; concrete widths
+need nothing. Addition/subtraction wrap at N bits in every build profile.
+Comparisons are unsigned; shifts that shift all bits out return zero, including
+shift counts ≥ N. `bool` and `Bits<1>` have different
 logical types despite equal physical widths. Conditionals select corresponding
 leaves and require the same logical type on both branches.
 
@@ -272,7 +277,10 @@ wrong counts and out-of-width values rather than silently truncating them.
 
 `Logic::schemas()` exposes input/output schemas. `evaluate_typed::<I,O>(input)`
 checks both declared schemas, evaluates the scalar graph, and reconstructs `O`.
-`evaluate(&[u64])` remains available and follows schema leaf order. Low-level
+`evaluate(&[...])` remains available and follows schema leaf order. Leaf and port
+values without a static width are `BitVec`s: unsigned values of up to 4096 bits
+that compare equal to a `u64` of the same value, so `evaluate`, `flatten` and
+`from_values` also accept and compare with plain `u64`s. Low-level
 `Builder` graphs use port insertion order and do not carry aggregate schemas
 unless explicitly attached and checked through `with_schemas()`.
 
@@ -329,7 +337,8 @@ bitlogic::system! {
 ```
 
 A unit's input and output structs both have a `state` field of the declared
-type, held in a register that resets to zero. In a connection, `u.state.f` is
+type, held in a register that resets to zero. The state may be a struct, an
+enum or a single scalar such as `Bits<96>`. In a connection, `u.state.f` is
 unit `u`'s registered state, `u.f` one of its other (combinational) outputs,
 `m.rdata` a memory's registered read data, and a param or input is named
 directly, with optional `.field` paths. Unit inputs take only registered values

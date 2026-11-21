@@ -117,13 +117,13 @@ fn composition_preserves_values_and_checks_port_shapes() {
         assert_eq!(native.get(), (!value) & 7);
         assert_eq!(twice.evaluate(&[value]).unwrap(), [value]);
     }
-    assert!(twice.evaluate(&[8]).is_err());
-    assert!(twice.evaluate(&[]).is_err());
+    assert!(twice.evaluate(&[8u64]).is_err());
+    assert!(twice.evaluate::<u64>(&[]).is_err());
     assert!(twice.to_verilog("bad-name").is_err());
     assert!(twice.then(&transform::ir().unwrap()).is_err());
 }
 
-fn binary_ir(op: Binary, width: u8) -> bitlogic::Logic {
+fn binary_ir(op: Binary, width: u16) -> bitlogic::Logic {
     let mut b = Builder::default();
     let a = b.input("a", width).unwrap();
     let rhs = b.input("b", width).unwrap();
@@ -174,8 +174,12 @@ fn every_binary_operation_and_width_boundary_has_defined_semantics() {
     assert_eq!((bits::<64>(u64::MAX) >> 64).get(), 0);
     let mut b = Builder::default();
     assert!(b.input("bad", 0).is_err());
+    // Widths go up to MAX_WIDTH; wider nodes are errors.
     let a = b.input("a", 64).unwrap();
-    assert!(b.concat(a, a).is_err());
+    assert!(b.concat(a, a).is_ok());
+    assert!(b.input("too_wide", bitlogic::MAX_WIDTH + 1).is_err());
+    let widest = b.input("widest", bitlogic::MAX_WIDTH).unwrap();
+    assert!(b.concat(widest, a).is_err());
 }
 
 fn run_hdl(source: String, marker: &str) {

@@ -125,7 +125,7 @@ fn every_state_matches_native_ir_hdl_and_oracle() {
                         mode,
                         flags,
                     };
-                    let raw = m.flatten();
+                    let raw = support::raw(&m.flatten());
                     let want = oracle(raw[0], raw[1], raw[2], flags[0], flags[1]);
                     let native = step(m);
                     assert_eq!(native.flatten(), want, "native {m:?}");

@@ -82,7 +82,7 @@ fn circuit_mermaid(module: &str, logic: &Logic) -> String {
     for (index, node) in logic.nodes().iter().enumerate() {
         let (label, edges): (String, Vec<(_, &str)>) = match node.operation {
             Operation::Input(port) => (format!("i_{}", logic.inputs()[port].name), vec![]),
-            Operation::Constant(value) => (format!("constant {value}"), vec![]),
+            Operation::Constant(ref value) => (format!("constant {value}"), vec![]),
             Operation::Not(a) => ("NOT".into(), vec![(a, "value")]),
             Operation::Binary(op, a, b) => (format!("{op:?}"), vec![(a, "lhs"), (b, "rhs")]),
             Operation::Mux { condition, yes, no } => (

@@ -1,3 +1,4 @@
+use crate::bitvec::{self, BitVec, MAX_WIDTH, words_for};
 use crate::{LogicValue, Schema};
 use std::{
     error,
@@ -14,9 +15,6 @@ impl fmt::Display for Error {
 impl error::Error for Error {}
 pub(crate) fn fail<T>(message: &str) -> Result<T, Error> {
     Err(Error(message.into()))
-}
-pub(crate) fn mask(width: u8) -> u64 {
-    u64::MAX >> (64 - width)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,7 +43,7 @@ pub enum Binary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Operation {
     Input(usize),
-    Constant(u64),
+    Constant(BitVec),
     Not(NodeId),
     Binary(Binary, NodeId, NodeId),
     Mux {
@@ -55,7 +53,7 @@ pub enum Operation {
     },
     Slice {
         value: NodeId,
-        offset: u8,
+        offset: u16,
     },
     Concat(NodeId, NodeId),
     Shift {
@@ -67,13 +65,13 @@ pub enum Operation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node {
-    pub width: u8,
+    pub width: u16,
     pub operation: Operation,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
     pub name: String,
-    pub width: u8,
+    pub width: u16,
     pub value: NodeId,
 }
 
@@ -84,6 +82,19 @@ pub struct Logic {
     pub(crate) inputs: Vec<Port>,
     pub(crate) outputs: Vec<Port>,
     pub(crate) schemas: Option<(Schema, Schema)>,
+    /// The interpreter's word layout, computed on first evaluation.
+    layout: std::sync::OnceLock<Layout>,
+    /// The `(input, output)` types last checked against `schemas` by
+    /// `evaluate_typed`, so later calls skip building the schemas.
+    typed: std::sync::OnceLock<(std::any::TypeId, std::any::TypeId)>,
+}
+
+/// Where each node's value starts in the interpreter's word array (and the
+/// total at the end), and whether a node and its operands all fit one word.
+#[derive(Clone, Debug)]
+struct Layout {
+    offsets: Vec<usize>,
+    small: Vec<bool>,
 }
 
 impl Logic {
@@ -104,12 +115,18 @@ impl Logic {
             }
         }
         self.schemas = Some((input, output));
+        self.typed = std::sync::OnceLock::new();
         Ok(self)
     }
 
     pub fn evaluate_typed<I: LogicValue, O: LogicValue>(&self, input: I) -> Result<O, Error> {
-        if self.schemas.as_ref() != Some(&(I::schema(), O::schema())) {
-            return fail("typed evaluation schema mismatch");
+        let types = (std::any::TypeId::of::<I>(), std::any::TypeId::of::<O>());
+        if self.typed.get() != Some(&types) {
+            if self.schemas.as_ref() != Some(&(I::schema(), O::schema())) {
+                return fail("typed evaluation schema mismatch");
+            }
+            // Remember the first matching pair; others are checked each time.
+            let _ = self.typed.set(types);
         }
         O::from_values(&self.evaluate(&input.flatten())?)
     }
@@ -188,25 +205,66 @@ impl Logic {
         &self.outputs
     }
 
-    /// Port values use schema leaf order (low-level graphs use insertion order). Out-of-range inputs are errors.
-    pub fn evaluate(&self, inputs: &[u64]) -> Result<Vec<u64>, Error> {
+    /// Port values (`u64`s or [`BitVec`]s) use schema leaf order (low-level
+    /// graphs use insertion order). Out-of-range inputs are errors.
+    pub fn evaluate<V: Clone + Into<BitVec>>(&self, inputs: &[V]) -> Result<Vec<BitVec>, Error> {
         if inputs.len() != self.inputs.len() {
             return fail("input port count mismatch");
         }
-        for (port, value) in self.inputs.iter().zip(inputs) {
-            if value & !mask(port.width) != 0 {
+        let inputs: Vec<BitVec> = inputs.iter().cloned().map(Into::into).collect();
+        for (port, value) in self.inputs.iter().zip(&inputs) {
+            if !value.fits(port.width) {
                 return fail("input value exceeds port width");
             }
         }
-        let mut values: Vec<u64> = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            let value = match node.operation {
-                Operation::Input(index) => inputs[index],
-                ref operation => compute(operation, |id| values[id.0], |id| self.nodes[id.0].width),
-            };
-            values.push(value & mask(node.width));
+        // Every node's value, in one array: node i at words offsets[i]..
+        let layout = self.layout.get_or_init(|| {
+            let mut offsets = Vec::with_capacity(self.nodes.len() + 1);
+            let mut total = 0;
+            for node in &self.nodes {
+                offsets.push(total);
+                total += words_for(usize::from(node.width));
+            }
+            offsets.push(total);
+            let small = self
+                .nodes
+                .iter()
+                .map(|node| {
+                    node.width <= 64
+                        && operands(&node.operation)
+                            .iter()
+                            .all(|id| self.nodes[id.0].width <= 64)
+                })
+                .collect();
+            Layout { offsets, small }
+        });
+        let offsets = &layout.offsets;
+        let mut words = vec![0u64; offsets[self.nodes.len()]];
+        for (i, node) in self.nodes.iter().enumerate() {
+            // Operands precede the node, so they are all in `done`.
+            let (done, rest) = words.split_at_mut(offsets[i]);
+            let out = &mut rest[..offsets[i + 1] - offsets[i]];
+            match node.operation {
+                Operation::Input(index) => bitvec::copy(out, inputs[index].words()),
+                ref operation if layout.small[i] => {
+                    let value = |id: NodeId| done[offsets[id.0]];
+                    out[0] = compute_small(operation, value, |id| self.nodes[id.0].width)
+                        & (u64::MAX >> (64 - node.width));
+                }
+                ref operation => compute(
+                    operation,
+                    |id| &done[offsets[id.0]..offsets[id.0 + 1]],
+                    |id| self.nodes[id.0].width,
+                    out,
+                    node.width,
+                ),
+            }
         }
-        Ok(self.outputs.iter().map(|p| values[p.value.0]).collect())
+        Ok(self
+            .outputs
+            .iter()
+            .map(|p| BitVec::from_words(&words[offsets[p.value.0]..offsets[p.value.0 + 1]]))
+            .collect())
     }
 
     /// Compose structured interfaces by nominal type and schema; low-level graphs by widths.
@@ -226,6 +284,8 @@ impl Logic {
             return fail("composition port widths/count mismatch");
         }
         let mut result = self.clone();
+        result.layout = std::sync::OnceLock::new();
+        result.typed = std::sync::OnceLock::new();
         let mut mapped = Vec::new();
         for node in &next.nodes {
             let id = if let Operation::Input(index) = node.operation {
@@ -233,7 +293,7 @@ impl Logic {
             } else {
                 let map = |id: NodeId| mapped[id.0];
                 let operation = match node.operation {
-                    Operation::Constant(v) => Operation::Constant(v),
+                    Operation::Constant(ref v) => Operation::Constant(v.clone()),
                     Operation::Not(a) => Operation::Not(map(a)),
                     Operation::Binary(op, a, b) => Operation::Binary(op, map(a), map(b)),
                     Operation::Mux { condition, yes, no } => Operation::Mux {
@@ -322,7 +382,7 @@ impl Logic {
         for (index, node) in self.nodes.iter().enumerate() {
             let expr = match node.operation {
                 Operation::Input(p) => format!("i_{}", self.inputs[p].name),
-                Operation::Constant(v) => format!("{}'h{:x}", node.width, v),
+                Operation::Constant(ref v) => v.to_verilog(node.width),
                 Operation::Not(a) => format!("~n{}", a.0),
                 Operation::Binary(op, a, b) => {
                     let op = match op {
@@ -368,15 +428,16 @@ impl Logic {
     }
 }
 
-/// The value of a non-input operation from its operands' values (unmasked).
-fn compute(
+/// The value of a non-input operation whose value and operands are at most
+/// 64 bits wide (unmasked): the interpreter's fast path.
+fn compute_small(
     operation: &Operation,
     value: impl Fn(NodeId) -> u64,
-    width: impl Fn(NodeId) -> u8,
+    width: impl Fn(NodeId) -> u16,
 ) -> u64 {
     match *operation {
         Operation::Input(_) => unreachable!("inputs have no operands"),
-        Operation::Constant(value) => value,
+        Operation::Constant(ref v) => v.to_u64().unwrap_or(0),
         Operation::Not(a) => !value(a),
         Operation::Binary(op, a, b) => {
             let (a, b) = (value(a), value(b));
@@ -416,6 +477,69 @@ fn compute(
     }
 }
 
+/// Write the value of a non-input operation, `width` bits wide, into `out`
+/// from its operands' words.
+fn compute<'a>(
+    operation: &'a Operation,
+    value: impl Fn(NodeId) -> &'a [u64],
+    width: impl Fn(NodeId) -> u16,
+    out: &mut [u64],
+    out_width: u16,
+) {
+    let w = usize::from(out_width);
+    match *operation {
+        Operation::Input(_) => unreachable!("inputs have no operands"),
+        Operation::Constant(ref v) => bitvec::copy(out, v.words()),
+        Operation::Not(a) => bitvec::not(out, value(a), w),
+        Operation::Binary(op, a, b) => {
+            let (a, b) = (value(a), value(b));
+            match op {
+                Binary::And => bitvec::bitwise(out, a, b, |x, y| x & y),
+                Binary::Or => bitvec::bitwise(out, a, b, |x, y| x | y),
+                Binary::Xor => bitvec::bitwise(out, a, b, |x, y| x ^ y),
+                Binary::Add => bitvec::add(out, a, b, w, false),
+                Binary::Sub => bitvec::add(out, a, b, w, true),
+                _ => {
+                    let order = bitvec::compare(a, b);
+                    let result = match op {
+                        Binary::Eq => order.is_eq(),
+                        Binary::Ne => order.is_ne(),
+                        Binary::Lt => order.is_lt(),
+                        Binary::Le => order.is_le(),
+                        Binary::Gt => order.is_gt(),
+                        _ => order.is_ge(),
+                    };
+                    bitvec::copy(out, &[u64::from(result)]);
+                }
+            }
+        }
+        Operation::Mux { condition, yes, no } => {
+            let chosen = if bitvec::is_zero(value(condition)) {
+                no
+            } else {
+                yes
+            };
+            bitvec::copy(out, value(chosen));
+        }
+        Operation::Slice { value: a, offset } => bitvec::shr(out, value(a), usize::from(offset), w),
+        Operation::Concat(a, b) => {
+            bitvec::concat(out, value(a), value(b), usize::from(width(b)), w);
+        }
+        Operation::Shift {
+            value: a,
+            amount,
+            left,
+        } => {
+            let amount = usize::try_from(amount).unwrap_or(usize::MAX).min(w);
+            if left {
+                bitvec::shl(out, value(a), amount, w);
+            } else {
+                bitvec::shr(out, value(a), amount, w);
+            }
+        }
+    }
+}
+
 fn operands(operation: &Operation) -> Vec<NodeId> {
     match *operation {
         Operation::Input(_) | Operation::Constant(_) => vec![],
@@ -445,16 +569,16 @@ pub struct Builder {
     outputs: Vec<Port>,
 }
 impl Builder {
-    fn push(&mut self, width: u8, operation: Operation) -> Result<NodeId, Error> {
-        if !(1..=64).contains(&width) {
-            return fail("bit widths must be in 1..=64");
+    fn push(&mut self, width: u16, operation: Operation) -> Result<NodeId, Error> {
+        if !(1..=MAX_WIDTH).contains(&width) {
+            return Err(Error(format!("bit widths must be in 1..={MAX_WIDTH}")));
         }
         // Constant folding: an operation on constants is a constant, a mux
         // with a constant condition is the selected operand, and a mux between
         // equal operands (one node, or equal constants) is that operand.
         if let Operation::Mux { condition, yes, no } = operation {
             if let Some(c) = self.constant_value(condition) {
-                return Ok(if c != 0 { yes } else { no });
+                return Ok(if c.is_zero() { no } else { yes });
             }
             if yes == no
                 || self
@@ -466,16 +590,19 @@ impl Builder {
         }
         let sources = operands(&operation);
         if !sources.is_empty() && sources.iter().all(|&id| self.constant_value(id).is_some()) {
-            let value = compute(
+            let mut out = vec![0; words_for(usize::from(width))];
+            compute(
                 &operation,
-                |id| self.constant_value(id).unwrap_or(0),
+                |id| self.constant_value(id).map_or(&[], BitVec::words),
                 |id| self.nodes[id.0].width,
+                &mut out,
+                width,
             );
-            return self.push_node(width, Operation::Constant(value & mask(width)));
+            return self.push_node(width, Operation::Constant(BitVec::from_words(&out)));
         }
         self.push_node(width, operation)
     }
-    fn push_node(&mut self, width: u8, operation: Operation) -> Result<NodeId, Error> {
+    fn push_node(&mut self, width: u16, operation: Operation) -> Result<NodeId, Error> {
         if self.nodes.len() >= 65_536 {
             return fail("logic exceeds 65536 expression nodes");
         }
@@ -483,13 +610,13 @@ impl Builder {
         self.nodes.push(Node { width, operation });
         Ok(id)
     }
-    fn width(&self, id: NodeId) -> Result<u8, Error> {
+    fn width(&self, id: NodeId) -> Result<u16, Error> {
         self.nodes
             .get(id.0)
             .map(|n| n.width)
             .ok_or_else(|| Error("invalid expression reference".into()))
     }
-    pub fn input(&mut self, name: &str, width: u8) -> Result<NodeId, Error> {
+    pub fn input(&mut self, name: &str, width: u16) -> Result<NodeId, Error> {
         if !identifier(name) || self.inputs.iter().any(|p| p.name == name) {
             return fail("invalid or duplicate input name");
         }
@@ -501,15 +628,14 @@ impl Builder {
         });
         Ok(value)
     }
-    pub fn constant(&mut self, width: u8, value: u64) -> Result<NodeId, Error> {
-        if !(1..=64).contains(&width) {
-            return fail("bit widths must be in 1..=64");
-        }
-        self.push(width, Operation::Constant(value & mask(width)))
+    /// A constant, cut to `width` bits.
+    pub fn constant(&mut self, width: u16, value: impl Into<BitVec>) -> Result<NodeId, Error> {
+        let value = value.into().masked(width);
+        self.push(width, Operation::Constant(value))
     }
     /// The value of `id` if it is a constant node.
-    pub fn constant_value(&self, id: NodeId) -> Option<u64> {
-        match self.nodes.get(id.0)?.operation {
+    pub fn constant_value(&self, id: NodeId) -> Option<&BitVec> {
+        match &self.nodes.get(id.0)?.operation {
             Operation::Constant(value) => Some(value),
             _ => None,
         }
@@ -539,14 +665,16 @@ impl Builder {
         }
         self.push(width, Operation::Mux { condition, yes, no })
     }
-    pub fn slice(&mut self, value: NodeId, offset: u8, width: u8) -> Result<NodeId, Error> {
-        if width == 0 || u16::from(offset) + u16::from(width) > u16::from(self.width(value)?) {
+    pub fn slice(&mut self, value: NodeId, offset: u16, width: u16) -> Result<NodeId, Error> {
+        if width == 0 || u32::from(offset) + u32::from(width) > u32::from(self.width(value)?) {
             return fail("slice out of bounds");
         }
         self.push(width, Operation::Slice { value, offset })
     }
     pub fn concat(&mut self, a: NodeId, b: NodeId) -> Result<NodeId, Error> {
-        self.push(self.width(a)? + self.width(b)?, Operation::Concat(a, b))
+        let width = u32::from(self.width(a)?) + u32::from(self.width(b)?);
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        self.push(width, Operation::Concat(a, b))
     }
     pub fn shift(&mut self, value: NodeId, amount: u32, left: bool) -> Result<NodeId, Error> {
         self.push(
@@ -578,6 +706,8 @@ impl Builder {
             inputs: self.inputs,
             outputs: self.outputs,
             schemas: None,
+            layout: std::sync::OnceLock::new(),
+            typed: std::sync::OnceLock::new(),
         })
     }
 }

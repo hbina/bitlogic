@@ -11,7 +11,7 @@ cargo test --workspace --locked
 make emit example
 ```
 
-The active workspace has 73 tests and 24 doctests (19 compile-fail).
+The active workspace has 80 tests and 27 doctests (21 compile-fail).
 
 The 2026-11-08 audit also reran the 16 historical processor CLI commands,
 the generic mapped and routed processor regressions, Ruff and the physical
@@ -246,6 +246,34 @@ Three implementation mutations each made a test fail: inactive fields built as
 inverted variant test. Compile-fail doctests cover non-logic field types,
 nested patterns and bindings in `|` alternatives. Macro unit tests cover
 generic and reference-typed variants.
+
+## Values wider than 64 bits (2026-11-21)
+
+`src/bitvec.rs` unit tests check the multi-word add, subtract, not, compare,
+shifts and hexadecimal printing against `u128` arithmetic at widths 1, 7, 63,
+64, 65, 100, 127 and 128, plus concat and slice across word boundaries.
+`tests/wide.rs` then checks:
+
+- 600 random pairs of 100-bit values, biased toward all-ones, zero, small
+  values and `a == b + 1`: sum, difference, bitwise mix, both shifts across a
+  word, comparisons, a 200-bit `concat` and a 40-bit slice across both the
+  operand and the word boundary, in native Rust, the IR and Icarus against a
+  `u128` oracle;
+- `Bits` words, ordering, `to_u64`, `Debug` and wrapping at a width that is not
+  a multiple of 64, and a `const` 128-bit value;
+- an enum whose variants carry 96- and 160-bit fields, in native Rust, the IR
+  and Icarus, including rejection of a 161-bit leaf value;
+- a `system!` with a 96-bit register state (a scalar state, newly supported)
+  and a 96-bit parameter, in the native and interpreted cycle models and in
+  Icarus, which runs the generated core for three edges.
+
+Compile-fail doctests reject `get()` on a 65-bit value and a 4097-bit width.
+Each was checked to compile at 64 and 4096 bits, so the doctests fail for
+the intended reason.
+
+The arty_ethernet suite (51 tests, including Vivado xsim) passes, and its
+nine generated Verilog files are byte-identical before and after the change. Native simulation is not slower: `≤64`-bit `Bits` operations and
+interpreter nodes take single-word paths.
 
 ## Fixed-capacity sets and maps (2026-11-18)
 

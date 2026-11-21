@@ -44,6 +44,24 @@ pub fn system(item: TokenStream) -> TokenStream {
     report(syn::parse::<system::Spec>(item).and_then(system::expand))
 }
 
+/// `Storage` impls for `Width<1>` through `Width<4096>` (bitlogic's
+/// `MAX_WIDTH`): `[u64; ⌈N/64⌉]`. Used once, inside bitlogic.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __bits_storage(_: TokenStream) -> TokenStream {
+    let impls = (1..=MAX_WIDTH as usize).map(|n| {
+        let words = n.div_ceil(64);
+        quote! {
+            // SAFETY: `Repr` is `[u64; ⌈N/64⌉]`, which is non-empty.
+            unsafe impl Storage for Width<#n> {
+                type Repr = [u64; #words];
+                const ZERO: Self::Repr = [0; #words];
+            }
+        }
+    });
+    quote!(#(#impls)*).into()
+}
+
 #[proc_macro_derive(LogicValue)]
 pub fn logic_value(item: TokenStream) -> TokenStream {
     report(syn::parse::<syn::DeriveInput>(item).and_then(derive_value))
@@ -86,12 +104,12 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
             fn schema() -> ::bitlogic::Schema {
                 ::bitlogic::Schema::structure::<Self>(vec![#((#labels.into(), <#types as ::bitlogic::LogicValue>::schema())),*])
             }
-            fn flatten(&self) -> ::std::vec::Vec<u64> {
+            fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
                 let mut values = ::std::vec::Vec::new();
                 #(values.extend(::bitlogic::LogicValue::flatten(&self.#names));)*
                 values
             }
-            fn read(values: &mut impl ::std::iter::Iterator<Item=u64>) -> ::std::result::Result<Self,::bitlogic::Error> {
+            fn read(values: &mut impl ::std::iter::Iterator<Item=::bitlogic::BitVec>) -> ::std::result::Result<Self,::bitlogic::Error> {
                 Ok(Self { #(#names: <#types as ::bitlogic::LogicValue>::read(values)?),* })
             }
         }
@@ -134,11 +152,14 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
             fn schema() -> ::bitlogic::Schema {
                 ::bitlogic::Schema::enumeration::<Self>(vec![#((#labels.into(), #values)),*])
             }
-            fn flatten(&self) -> ::std::vec::Vec<u64> {
-                ::std::vec![match self { #(Self::#idents => #values),* }]
+            fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
+                ::std::vec![::bitlogic::BitVec::from(::bitlogic::LogicValue::as_index(self).unwrap_or(0))]
             }
-            fn read(values: &mut impl ::std::iter::Iterator<Item=u64>) -> ::std::result::Result<Self,::bitlogic::Error> {
-                match values.next() {
+            fn as_index(&self) -> ::std::option::Option<u64> {
+                ::std::option::Option::Some(match self { #(Self::#idents => #values),* })
+            }
+            fn read(values: &mut impl ::std::iter::Iterator<Item=::bitlogic::BitVec>) -> ::std::result::Result<Self,::bitlogic::Error> {
+                match values.next().and_then(|v| v.to_u64()) {
                     #(Some(#values) => Ok(Self::#idents),)*
                     _ => Err(::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into())),
                 }
@@ -196,11 +217,11 @@ fn derive_tagged(name: &syn::Ident, data: &syn::DataEnum, values: &[u64]) -> syn
             });
         }
         reads.push(if types.is_empty() {
-            quote!(if tag == #value { result = Some(#shape); })
+            quote!(if tag == Some(#value) { result = Some(#shape); })
         } else {
             quote! {
                 #(let #locals = <#types as ::bitlogic::LogicValue>::read(values)?;)*
-                if tag == #value {
+                if tag == Some(#value) {
                     result = Some(#shape);
                 } else if #(::bitlogic::LogicValue::flatten(&#locals) != <#types as ::bitlogic::LogicValue>::schema().zero_values())||* {
                     return Err(::bitlogic::Error(concat!("non-canonical inactive ", stringify!(#name), " variant fields").into()));
@@ -213,13 +234,13 @@ fn derive_tagged(name: &syn::Ident, data: &syn::DataEnum, values: &[u64]) -> syn
             fn schema() -> ::bitlogic::Schema {
                 ::bitlogic::Schema::tagged::<Self>(::std::vec![#(#schemas),*])
             }
-            fn flatten(&self) -> ::std::vec::Vec<u64> {
-                let mut values = ::std::vec![match self { #(#tags),* }];
+            fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
+                let mut values = ::std::vec![::bitlogic::BitVec::from(match self { #(#tags),* })];
                 #(#payloads)*
                 values
             }
-            fn read(values: &mut impl ::std::iter::Iterator<Item=u64>) -> ::std::result::Result<Self,::bitlogic::Error> {
-                let tag = values.next().ok_or_else(|| ::bitlogic::Error("missing value leaf".into()))?;
+            fn read(values: &mut impl ::std::iter::Iterator<Item=::bitlogic::BitVec>) -> ::std::result::Result<Self,::bitlogic::Error> {
+                let tag = values.next().ok_or_else(|| ::bitlogic::Error("missing value leaf".into()))?.to_u64();
                 let mut result = None;
                 #(#reads)*
                 result.ok_or_else(|| ::bitlogic::Error(concat!("invalid ", stringify!(#name), " discriminant").into()))
@@ -263,6 +284,8 @@ fn generic_integers(arguments: &PathArguments) -> syn::Result<Vec<u64>> {
 }
 
 type Env = BTreeMap<String, Tokens>;
+/// bitlogic's `MAX_WIDTH`: the widest `Bits<N>`.
+const MAX_WIDTH: u64 = 4096;
 /// One `match` arm's pattern state: its emitted tests and the
 /// variant fields it binds.
 struct ArmMatch<'a> {
@@ -698,8 +721,8 @@ impl Lower {
                     return Err(error(call, "bits requires one integer literal"));
                 }
                 let generic = generic_integers(&last.arguments)?;
-                if generic.len() != 1 || !(1..=64).contains(&generic[0]) {
-                    return Err(error(call, "bits requires one width in 1..=64"));
+                if generic.len() != 1 || !(1..=MAX_WIDTH).contains(&generic[0]) {
+                    return Err(error(call, "bits requires one width in 1..=4096"));
                 }
                 let n = generic[0] as usize;
                 let value = integer(&call.args[0])?;
@@ -781,8 +804,8 @@ impl Lower {
                             return Err(error(call, "use bit(index) or slice::<N>(offset)"));
                         };
                         let width =
-                            u8::try_from(width).map_err(|_| error(call, "slice out of bounds"))?;
-                        let offset = u8::try_from(integer(&call.args[0])?)
+                            u16::try_from(width).map_err(|_| error(call, "slice out of bounds"))?;
+                        let offset = u16::try_from(integer(&call.args[0])?)
                             .map_err(|_| error(call, "slice out of bounds"))?;
                         Ok(self.emit(quote!(#a.slice(__logic_builder,#offset,#width,#bit)?)))
                     }
@@ -797,9 +820,9 @@ impl Lower {
                     }
                     "concat" if call.args.len() == 1 && generic.len() == 2 => {
                         let b = self.expr(&call.args[0], env)?;
-                        let low = u8::try_from(generic[0])
+                        let low = u16::try_from(generic[0])
                             .map_err(|_| error(call, "concatenation width mismatch"))?;
-                        let total = u8::try_from(generic[1])
+                        let total = u16::try_from(generic[1])
                             .map_err(|_| error(call, "concatenation width mismatch"))?;
                         Ok(self.emit(quote!(#a.concat(__logic_builder,&#b,#low,#total)?)))
                     }

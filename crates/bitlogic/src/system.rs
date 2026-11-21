@@ -7,7 +7,7 @@
 //! into the core module, one registered wrapper per unit, the ROMs and the
 //! shared simple dual-port RAM.
 use crate::value::Schema;
-use crate::{Error, Logic, LogicValue};
+use crate::{BitVec, Error, Logic, LogicValue};
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -77,9 +77,10 @@ pub struct Memory<T> {
 }
 
 fn index<A: LogicValue>(address: A) -> usize {
-    let leaves = address.flatten();
-    assert_eq!(leaves.len(), 1, "memory addresses are a single leaf");
-    usize::try_from(leaves[0]).expect("address fits usize")
+    address
+        .as_index()
+        .and_then(|a| usize::try_from(a).ok())
+        .expect("memory addresses are a single leaf that fits usize")
 }
 
 impl<T: LogicValue + Copy> Memory<T> {
@@ -139,7 +140,7 @@ pub enum Source {
 pub struct ParamSpec {
     pub name: &'static str,
     pub schema: Schema,
-    pub default: Vec<u64>,
+    pub default: Vec<BitVec>,
 }
 
 pub struct InputSpec {
@@ -160,7 +161,7 @@ pub struct MemorySpec {
     pub element: Schema,
     pub addr_bits: u32,
     /// `Some` for a ROM: one leaf value per cell.
-    pub contents: Option<Vec<u64>>,
+    pub contents: Option<Vec<BitVec>>,
 }
 
 pub struct UnitSpec {
@@ -231,7 +232,7 @@ impl Value {
             signals: self.signals[offset..offset + n].to_vec(),
         })
     }
-    fn widths(&self) -> Result<Vec<u8>, Error> {
+    fn widths(&self) -> Result<Vec<u16>, Error> {
         self.schema
             .leaves()
             .iter()
@@ -239,7 +240,7 @@ impl Value {
             .collect()
     }
     /// The single leaf of a scalar value, checked against `width`.
-    fn scalar(&self, width: u8, what: &str) -> Result<&str, Error> {
+    fn scalar(&self, width: u16, what: &str) -> Result<&str, Error> {
         match (self.widths()?.as_slice(), self.signals.as_slice()) {
             ([w], [s]) if *w == width => Ok(s),
             _ => fail(format!("{what}: expected a {width}-bit scalar")),
@@ -371,11 +372,22 @@ const VERILOG_KEYWORDS: &[&str] = &[
     "rst",
 ];
 
-fn hex(width: u8, value: u64) -> String {
-    format!("{width}'h{value:x}")
+fn hex(width: u16, value: &BitVec) -> String {
+    value.to_verilog(width)
 }
 
 const STATE: &str = "state";
+
+/// The unit wrapper's output for a state input port: `s` for a scalar state
+/// (port `state`), `s_<field>` for `state_<field>`; `None` for other ports.
+fn state_output(port: &str) -> Option<String> {
+    if port == STATE {
+        Some("s".into())
+    } else {
+        port.strip_prefix("state_")
+            .map(|field| format!("s_{field}"))
+    }
+}
 
 impl Design {
     /// The value a source refers to, in the core module's signal names.
@@ -429,8 +441,12 @@ impl Design {
             signals: state
                 .signals
                 .iter()
-                .map(|port| format!("{name}_s_{}", &port[STATE.len() + 1..]))
-                .collect(),
+                .map(|port| {
+                    state_output(port)
+                        .map(|s| format!("{name}_{s}"))
+                        .ok_or_else(|| Error(format!("{what}: state port `{port}`")))
+                })
+                .collect::<Result<_, _>>()?,
             ..state
         };
         let output = Value {
@@ -504,7 +520,7 @@ impl Design {
         for p in &self.params {
             let value = param_value(p);
             for ((name, w), v) in value.signals.iter().zip(value.widths()?).zip(&p.default) {
-                params.push(format!("parameter [{}:0] {name} = {}", w - 1, hex(w, *v)));
+                params.push(format!("parameter [{}:0] {name} = {}", w - 1, hex(w, v)));
             }
         }
         let mut ports = vec!["input wire clk".to_string(), "input wire rst".to_string()];
@@ -614,7 +630,7 @@ impl Design {
             ));
         }
         // The register resets to all zeros, so the zero value must be that.
-        if u.state.zero_values().iter().any(|&v| v != 0) {
+        if u.state.zero_values().iter().any(|v| !v.is_zero()) {
             return fail(format!(
                 "unit `{}`: state enums (also inside variant fields) must list a variant with discriminant 0 first",
                 u.name
@@ -657,7 +673,8 @@ impl Design {
             bindings.push(format!(".o_{port}({wire})"));
         }
         for (port, wire) in raw.0.iter().zip(&state.signals) {
-            bindings.push(format!(".s_{}({wire})", &port[STATE.len() + 1..]));
+            let s = state_output(port).expect("a state port");
+            bindings.push(format!(".{s}({wire})"));
         }
         writeln!(
             text,
@@ -677,7 +694,7 @@ impl Design {
 
     fn memory_instance(&self, text: &mut String, m: &MemorySpec) -> Result<(), Error> {
         let width = m.element.width()?;
-        let addr = u8::try_from(m.addr_bits).expect("checked");
+        let addr = u16::try_from(m.addr_bits).expect("checked");
         let what = format!("memory `{}`", m.name);
         let read = self
             .reads
@@ -773,11 +790,17 @@ fn unit_values(u: &UnitSpec) -> Result<(Value, Value), Error> {
 /// Registers `reg` <= `next`, reset to zero.
 fn registers(text: &mut String, reg: &Value, next: &[String]) -> Result<(), Error> {
     for (name, w) in reg.signals.iter().zip(reg.widths()?) {
-        writeln!(text, "    reg [{}:0] {name} = {};", w - 1, hex(w, 0)).unwrap();
+        writeln!(
+            text,
+            "    reg [{}:0] {name} = {};",
+            w - 1,
+            hex(w, &BitVec::zero())
+        )
+        .unwrap();
     }
     text.push_str("    always @(posedge clk) begin\n        if (rst) begin\n");
     for (name, w) in reg.signals.iter().zip(reg.widths()?) {
-        writeln!(text, "            {name} <= {};", hex(w, 0)).unwrap();
+        writeln!(text, "            {name} <= {};", hex(w, &BitVec::zero())).unwrap();
     }
     text.push_str("        end else begin\n");
     for (name, value) in reg.signals.iter().zip(next) {
@@ -788,9 +811,9 @@ fn registers(text: &mut String, reg: &Value, next: &[String]) -> Result<(), Erro
 }
 
 /// Synchronous ROM with one cycle of read latency, like the RAM.
-fn rom_verilog(module: &str, m: &MemorySpec, contents: &[u64]) -> Result<String, Error> {
+fn rom_verilog(module: &str, m: &MemorySpec, contents: &[BitVec]) -> Result<String, Error> {
     let (w, a) = (m.element.width()?, m.addr_bits);
-    let first = contents.first().copied().unwrap_or(0);
+    let first = contents.first().cloned().unwrap_or_default();
     let mut text = format!(
         "// Generated by bitlogic; do not edit.\n`timescale 1ns / 1ps\n\
          module {module}(\n    input wire clk,\n    input wire [{}:0] addr,\n    \
@@ -798,10 +821,10 @@ fn rom_verilog(module: &str, m: &MemorySpec, contents: &[u64]) -> Result<String,
          always @(posedge clk) begin\n        case (addr)\n",
         a - 1,
         w - 1,
-        hex(w, first),
+        hex(w, &first),
     );
-    for (address, &value) in contents.iter().enumerate() {
-        if value != 0 {
+    for (address, value) in contents.iter().enumerate() {
+        if !value.is_zero() {
             writeln!(
                 text,
                 "            {a}'d{address}: data <= {};",
@@ -813,7 +836,7 @@ fn rom_verilog(module: &str, m: &MemorySpec, contents: &[u64]) -> Result<String,
     writeln!(
         text,
         "            default: data <= {};\n        endcase\n    end\nendmodule",
-        hex(w, 0)
+        hex(w, &BitVec::zero())
     )
     .unwrap();
     Ok(text)
@@ -866,16 +889,15 @@ impl Logic {
             String::from("// Generated by bitlogic; do not edit.\n`timescale 1ns / 1ps\n");
         text.push_str(&self.to_verilog(&inner)?);
 
-        let prefix = format!("{STATE}_");
         let split = |ports: &[crate::Port]| -> (Vec<crate::Port>, Vec<crate::Port>) {
             ports
                 .iter()
                 .cloned()
-                .partition(|p| p.name.starts_with(&prefix))
+                .partition(|p| state_output(&p.name).is_some())
         };
         let (state_in, other_in) = split(self.inputs());
         let (state_out, other_out) = split(self.outputs());
-        let shape = |ports: &[crate::Port]| -> Vec<(String, u8)> {
+        let shape = |ports: &[crate::Port]| -> Vec<(String, u16)> {
             ports.iter().map(|p| (p.name.clone(), p.width)).collect()
         };
         if state_in.is_empty() || shape(&state_in) != shape(&state_out) {
@@ -891,8 +913,8 @@ impl Logic {
             ports.push(format!("output wire [{}:0] o_{}", p.width - 1, p.name));
         }
         for p in &state_in {
-            let field = &p.name[prefix.len()..];
-            ports.push(format!("output wire [{}:0] s_{field}", p.width - 1));
+            let s = state_output(&p.name).expect("a state port");
+            ports.push(format!("output wire [{}:0] {s}", p.width - 1));
         }
         writeln!(
             text,
@@ -906,9 +928,9 @@ impl Logic {
         let mut connections = Vec::new();
         let mut offset = 0;
         for p in &state_in {
-            let field = &p.name[prefix.len()..];
+            let s = state_output(&p.name).expect("a state port");
             let (lo, hi) = (offset, offset + usize::from(p.width) - 1);
-            writeln!(text, "    assign s_{field} = state[{hi}:{lo}];").unwrap();
+            writeln!(text, "    assign {s} = state[{hi}:{lo}];").unwrap();
             connections.push(format!(".i_{}(state[{hi}:{lo}])", p.name));
             connections.push(format!(".o_{}(next_state[{hi}:{lo}])", p.name));
             offset += usize::from(p.width);

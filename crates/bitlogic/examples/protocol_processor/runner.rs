@@ -41,7 +41,12 @@ pub fn ir_step(ir: &Logic, state: State, word: u32, inputs: u8, reset: bool) -> 
     }
     let mut ports = state.values().to_vec();
     ports.extend([u64::from(word), u64::from(inputs)]);
-    let next = ir.evaluate(&ports).expect("valid processor port widths");
+    let next: Vec<u64> = ir
+        .evaluate(&ports)
+        .expect("valid processor port widths")
+        .iter()
+        .map(|v| v.to_u64().expect("processor ports are at most 64 bits"))
+        .collect();
     State {
         pc: next[0] as u8,
         wait: next[1] as u16,
