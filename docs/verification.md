@@ -396,6 +396,33 @@ random ARP, ICMP, IPv4, beacon and corrupted-FCS traffic with RX-ring overflow
 bursts, and the two Verilog cores produced identical `tx_en`, `txd`,
 `rx_active` and `tx_frame_toggle` over 63,400 cycles in Vivado xsim.
 
+## Ports (2026-11-23)
+
+`tests/ports.rs` declares a unit that runs read-modify-write passes over a
+256-word memory outside the system, through a `port`: read `mem[a]`, wait for
+the response, write back `mem[a] + k + 1`, step an LFSR address. Its results
+cannot depend on when the other side accepts or answers, so they are checked
+against a plain sequential loop (memory contents and the sum of every value
+read, allowing for a last pass that has read but not yet written) over 24
+trials of 6,000 cycles with an `InOrder` memory of depth 1 to 4 and random
+latency up to 24 edges, every third trial with a responder that also stalls
+both channels on a random half of the cycles. Every transfer happens only
+with both valid and ready high. The IR-evaluated model equals the native one
+on all six port signals and every output for 3,000 cycles. The generated
+Verilog runs under Icarus for 2,000 cycles with the other side's signals
+replayed from the cycle model, and every signal the core drives (the
+request while valid, `rsp_ready`, and the outputs, one of them a registered
+port signal) is compared before and after each edge; the run makes over
+300 transfers. An unconnected port never transfers. The macro accepts a
+declaration with a port and rejects 12 malformed ones (missing `request` or
+`respond`, either connected twice, wrong arity, a port driving a port, an
+unknown port, an unregistered port output, reading a port other than through
+its three signals, a duplicate name, a missing `=>`).
+
+Three injected bugs were each caught: a cycle model that transfers requests
+without `req_ready`, Verilog that wires `req_ready` to the response-valid
+port, and an `InOrder` that offers a response before its latency.
+
 ## Build and CI
 
 `make emit` writes `build/select_logic.v`; `make example` prints the HDL example.

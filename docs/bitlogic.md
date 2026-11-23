@@ -400,6 +400,53 @@ leaf path (`ctl_go`, `sum`). The connection struct literal is pasted into the
 cycle model, so rustc checks connection types; `verilog()` checks widths and
 schemas again and rejects unconnected fields.
 
+### Ports
+
+A `port` connects the system to something outside it whose timing the system
+does not control, such as a DRAM controller behind clock-domain-crossing
+FIFOs. It has a request channel out and a response channel in, each with a
+valid/ready handshake that transfers on an edge where both are high:
+
+```rust
+bitlogic::system! {
+    mod rmw {
+        port mem: MemReq => MemRsp;
+        unit client: ClientState = client(ClientIn {
+            state,
+            req_ready: mem.req_ready,     // the other side takes a request
+            rsp_valid: mem.rsp_valid,     // a response is offered
+            rsp: mem.rsp,                 // ... and this is it
+        });
+        request mem(client.req_valid, client.req);
+        respond mem(client.rsp_ready);
+    }
+}
+```
+
+`port.req_ready`, `port.rsp_valid` and `port.rsp` (with optional `.field`
+paths) are this cycle's values from outside, unregistered, so a unit can
+answer them in the same cycle: `request port(valid, data)` and
+`respond port(ready)` are driven by any connection, usually a unit's
+combinational outputs. A port signal cannot drive a port, and drives an
+`output` only through a register. The other side must not make
+`req_ready`, `rsp_valid` or `rsp` depend combinationally on the system's
+`req_valid`, `req` or `rsp_ready` (FIFO flags and registered outputs do
+not), which keeps the handshake free of combinational loops.
+
+In Verilog the core gains the ports `<port>_req_valid`, `<port>_req_<leaf>`
+and `<port>_rsp_ready` (outputs, combinational) and `<port>_req_ready`,
+`<port>_rsp_valid` and `<port>_rsp_<leaf>` (inputs). In the cycle model,
+`Core` has a field `<port>: Box<dyn bitlogic::system::Responder<Req, Rsp>>`
+that plays the other side: before each edge the model asks it what it offers
+(`req_ready`, `rsp`), evaluates the units, then tells it what transferred
+(`edge`). A new `Core` starts with `Unconnected` (never ready, never
+responds). `bitlogic::system::InOrder` is a ready-made responder: up to
+`depth` requests in flight, each served by a closure when accepted (so a
+memory model sees requests in order) and answered `latency()` edges later, in
+order; requests without a response (writes) keep their place. `Outputs` has
+a `PortCycle` per port with all six signals of the cycle before the edge,
+which is what a test replays against the generated Verilog.
+
 ## HDL integration
 
 Ports use `i_`/`o_` prefixes. A nested path `state.counter` becomes `i_state_counter`

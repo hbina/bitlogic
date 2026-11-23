@@ -61,6 +61,22 @@ enum Item {
         memory: Ident,
         args: Vec<Expr>,
     },
+    Port {
+        attrs: Vec<Attribute>,
+        name: Ident,
+        req: Type,
+        rsp: Type,
+    },
+    /// `request port(valid, data)`.
+    Request {
+        port: Ident,
+        args: Vec<Expr>,
+    },
+    /// `respond port(ready)`.
+    Respond {
+        port: Ident,
+        args: Vec<Expr>,
+    },
 }
 
 fn keyword(input: ParseStream, word: &str) -> syn::Result<()> {
@@ -180,22 +196,43 @@ impl Parse for Item {
                     input: literal,
                 }
             }
-            "write" | "read" => {
+            "write" | "read" | "request" | "respond" => {
                 if let Some(attr) = attrs.first() {
                     return Err(error(attr, "port connections take no attributes"));
                 }
-                let memory = input.parse()?;
+                let target = input.parse()?;
                 let args = arguments(input)?;
-                if kind == "write" {
-                    Item::Write { memory, args }
-                } else {
-                    Item::Read { memory, args }
+                match kind.to_string().as_str() {
+                    "write" => Item::Write {
+                        memory: target,
+                        args,
+                    },
+                    "read" => Item::Read {
+                        memory: target,
+                        args,
+                    },
+                    "request" => Item::Request { port: target, args },
+                    _ => Item::Respond { port: target, args },
+                }
+            }
+            "port" => {
+                let name = input.parse()?;
+                input.parse::<Token![:]>()?;
+                let req = input.parse()?;
+                input.parse::<Token![=>]>()?;
+                let rsp = input.parse()?;
+                Item::Port {
+                    attrs,
+                    name,
+                    req,
+                    rsp,
                 }
             }
             _ => {
                 return Err(error(
                     kind,
-                    "expected `param`, `input`, `output`, `ram`, `rom`, `unit`, `write` or `read`",
+                    "expected `param`, `input`, `output`, `ram`, `rom`, `unit`, `port`, \
+                     `write`, `read`, `request` or `respond`",
                 ));
             }
         };
@@ -232,6 +269,14 @@ enum Kind {
     Output,
     Memory,
     Unit,
+    Port,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PortSignal {
+    ReqReady,
+    RspValid,
+    Rsp,
 }
 
 /// Where a connection expression points.
@@ -241,6 +286,7 @@ enum Source {
     State(Ident, Vec<Ident>),
     Output(Ident, Vec<Ident>),
     Rdata(Ident),
+    Port(Ident, PortSignal, Vec<Ident>),
 }
 
 /// `a.b.c` as identifiers.
@@ -262,7 +308,7 @@ fn path_of(expr: &Expr) -> syn::Result<Vec<Ident>> {
         _ => Err(error(
             expr,
             "connections are names: a param, an input, `unit.state.field`, \
-             `unit.output` or `memory.rdata`",
+             `unit.output`, `memory.rdata` or a port signal",
         )),
     }
 }
@@ -294,6 +340,23 @@ impl Context {
                 }
                 Source::Rdata(head.clone())
             }
+            Kind::Port => match rest.split_first() {
+                Some((s, [])) if s == "req_ready" => {
+                    Source::Port(head.clone(), PortSignal::ReqReady, vec![])
+                }
+                Some((s, [])) if s == "rsp_valid" => {
+                    Source::Port(head.clone(), PortSignal::RspValid, vec![])
+                }
+                Some((s, path)) if s == "rsp" => {
+                    Source::Port(head.clone(), PortSignal::Rsp, path.to_vec())
+                }
+                _ => {
+                    return Err(error(
+                        expr,
+                        "a port is read as `port.req_ready`, `port.rsp_valid` or `port.rsp`",
+                    ));
+                }
+            },
             Kind::Unit => match rest.split_first() {
                 Some((s, path)) if s == "state" => Source::State(head.clone(), path.to_vec()),
                 Some(_) => Source::Output(head.clone(), rest.to_vec()),
@@ -328,6 +391,14 @@ impl Context {
                 quote!(#local.#(#path).*)
             }
             Source::Rdata(memory) => quote!(self.#memory.rdata),
+            Source::Port(port, signal, path) => {
+                let local = match signal {
+                    PortSignal::ReqReady => format_ident!("__port_{}_ready", port),
+                    PortSignal::RspValid => format_ident!("__port_{}_rsp_valid", port),
+                    PortSignal::Rsp => format_ident!("__port_{}_rsp", port),
+                };
+                quote!(#local #(.#path)*)
+            }
         }
     }
 
@@ -357,6 +428,19 @@ impl Context {
             Source::Rdata(m) => {
                 let memory = m.to_string();
                 quote!(::bitlogic::system::Source::Rdata { memory: #memory })
+            }
+            Source::Port(port, signal, p) => {
+                let (name, rest) = (port.to_string(), path(p));
+                let signal = match signal {
+                    PortSignal::ReqReady => quote!(ReqReady),
+                    PortSignal::RspValid => quote!(RspValid),
+                    PortSignal::Rsp => quote!(Rsp),
+                };
+                quote!(::bitlogic::system::Source::Port {
+                    name: #name,
+                    signal: ::bitlogic::system::PortSignal::#signal,
+                    path: #rest,
+                })
             }
         }
     }
@@ -393,7 +477,11 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 (name, Kind::Memory)
             }
             Item::Unit { name, .. } => (name, Kind::Unit),
-            Item::Write { .. } | Item::Read { .. } => continue,
+            Item::Port { name, .. } => (name, Kind::Port),
+            Item::Write { .. }
+            | Item::Read { .. }
+            | Item::Request { .. }
+            | Item::Respond { .. } => continue,
         };
         let key = id.to_string();
         if RESERVED.contains(&key.as_str()) || key.starts_with("__") {
@@ -425,6 +513,12 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
     let mut design_writes = Vec::new();
     let mut design_reads = Vec::new();
     let mut ports: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    // Per `port`: its types, then its `request` and `respond` connections.
+    let mut links: BTreeMap<String, (Ident, Type, Type)> = BTreeMap::new();
+    let mut requests: BTreeMap<String, (Source, Source)> = BTreeMap::new();
+    let mut responds: BTreeMap<String, Source> = BTreeMap::new();
+    let mut port_prelude = Vec::new();
+    let mut port_cycles = Vec::new();
 
     for item in &items {
         match item {
@@ -492,6 +586,12 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                         return Err(error(
                             source,
                             "an unregistered input cannot drive an output",
+                        ));
+                    }
+                    (Source::Port(..), false) => {
+                        return Err(error(
+                            source,
+                            "a port signal can drive an output only if it is `registered`",
                         ));
                     }
                     _ => {}
@@ -621,6 +721,64 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     connections: ::std::vec![#(#connections),*],
                 }));
             }
+            Item::Port {
+                attrs,
+                name,
+                req,
+                rsp,
+            } => {
+                fields.push(quote!(
+                    #(#attrs)*
+                    /// The other side of this port: replace it to connect one.
+                    pub #name: ::std::boxed::Box<dyn ::bitlogic::system::Responder<#req, #rsp>>,
+                ));
+                inits.push(quote!(#name: ::std::boxed::Box::new(::bitlogic::system::Unconnected),));
+                let last = format_ident!("__port_{}", name);
+                fields.push(quote!(#last: ::bitlogic::system::PortCycle<#req, #rsp>,));
+                inits.push(quote!(#last: ::bitlogic::system::PortCycle::idle(),));
+                output_fields.push(quote!(
+                    /// This port's signals during the cycle before the edge.
+                    pub #name: ::bitlogic::system::PortCycle<#req, #rsp>,
+                ));
+                output_values.push(quote!(#name: self.#last,));
+                links.insert(name.to_string(), (name.clone(), req.clone(), rsp.clone()));
+            }
+            Item::Request { port, args } | Item::Respond { port, args } => {
+                let request = matches!(item, Item::Request { .. });
+                if cx.kinds.get(&port.to_string()) != Some(&Kind::Port) {
+                    return Err(error(port, "not a declared `port`"));
+                }
+                let want = if request { 2 } else { 1 };
+                if args.len() != want {
+                    let shape = if request {
+                        "request port(valid, data)"
+                    } else {
+                        "respond port(ready)"
+                    };
+                    return Err(error(port, &format!("expected `{shape}`")));
+                }
+                let srcs = args
+                    .iter()
+                    .map(|a| cx.source(a))
+                    .collect::<syn::Result<Vec<_>>>()?;
+                for (src, arg) in srcs.iter().zip(args) {
+                    if let Source::Port(..) = src {
+                        return Err(error(arg, "a port signal cannot drive a port"));
+                    }
+                }
+                let key = port.to_string();
+                let mut srcs = srcs.into_iter();
+                let duplicate = if request {
+                    let valid = srcs.next().expect("two");
+                    let data = srcs.next().expect("two");
+                    requests.insert(key, (valid, data)).is_some()
+                } else {
+                    responds.insert(key, srcs.next().expect("one")).is_some()
+                };
+                if duplicate {
+                    return Err(error(port, "this port is already connected"));
+                }
+            }
             Item::Write { memory, args } | Item::Read { memory, args } => {
                 let write = matches!(item, Item::Write { .. });
                 let Some(&rom) = memories.get(&memory.to_string()) else {
@@ -670,6 +828,49 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 }
             }
         }
+    }
+    let mut design_ports = Vec::new();
+    for (key, (port, req, rsp)) in &links {
+        let (Some((valid, data)), Some(ready)) = (requests.get(key), responds.get(key)) else {
+            return Err(error(port, "this port needs `request` and `respond`"));
+        };
+        let ready_local = format_ident!("__port_{}_ready", port);
+        let offer = format_ident!("__port_{}_offer", port);
+        let rsp_valid = format_ident!("__port_{}_rsp_valid", port);
+        let rsp_local = format_ident!("__port_{}_rsp", port);
+        port_prelude.push(quote!(
+            let #ready_local: bool = self.#port.req_ready();
+            let #offer: ::std::option::Option<#rsp> = self.#port.rsp();
+            let #rsp_valid: bool = #offer.is_some();
+            let #rsp_local: #rsp = #offer.unwrap_or_else(::bitlogic::LogicValue::zeroed);
+        ));
+        let cycle = format_ident!("__cycle_{}", port);
+        let last = format_ident!("__port_{}", port);
+        let (v, d, r) = (cx.native(valid), cx.native(data), cx.native(ready));
+        port_cycles.push(quote!(
+            let #cycle: ::bitlogic::system::PortCycle<#req, #rsp> = ::bitlogic::system::PortCycle {
+                req_valid: #v,
+                req: #d,
+                req_ready: #ready_local,
+                rsp_valid: #rsp_valid,
+                rsp: #rsp_local,
+                rsp_ready: #r,
+            };
+        ));
+        commits.push(quote!(
+            self.#port.edge(#cycle.request(), #cycle.response().is_some());
+            self.#last = #cycle;
+        ));
+        let label = port.to_string();
+        let (v, d, r) = (cx.design(valid), cx.design(data), cx.design(ready));
+        design_ports.push(quote!(::bitlogic::system::PortSpec {
+            name: #label,
+            request: <#req as ::bitlogic::LogicValue>::schema(),
+            response: <#rsp as ::bitlogic::LogicValue>::schema(),
+            req_valid: #v,
+            req: #d,
+            rsp_ready: #r,
+        }));
     }
     for (memory, rom) in &memories {
         let (w, r) = ports.get(memory).copied().unwrap_or_default();
@@ -744,11 +945,15 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     fn __zero_or<T: ::bitlogic::LogicValue>(rst: bool, next: T) -> T {
                         if rst { T::zeroed() } else { next }
                     }
-                    // Units see only registered values, so order is free.
+                    // What each port's other side offers this cycle.
+                    #(#port_prelude)*
+                    // Units see only registered values and port signals, so
+                    // order is free.
                     #(#evaluations)*
                     // Read-first memories: sample before this edge's writes.
                     #(#reads)*
                     #(#latches)*
+                    #(#port_cycles)*
                     #(#writes)*
                     #(#commits)*
                     self.outputs()
@@ -771,6 +976,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     units: ::std::vec![#(#design_units),*],
                     writes: ::std::vec![#(#design_writes),*],
                     reads: ::std::vec![#(#design_reads),*],
+                    ports: ::std::vec![#(#design_ports),*],
                 })
             }
 
@@ -860,6 +1066,75 @@ mod tests {
             ("output o: bool = sync, latched;", "expected `registered`"),
         ] {
             let err = check(items).unwrap_err().to_string();
+            assert!(err.contains(message), "{items}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_and_checks_ports() {
+        let ports = "write buf(u.we, u.addr, u.data); read buf(u.addr); read table(u.addr);";
+        let unit = "unit u: S = f(I { state, r: p.req_ready, v: p.rsp_valid, d: p.rsp.data });";
+        let link = "request p(u.valid, u.req); respond p(u.ready);";
+        check(&format!(
+            "port p: Req => Rsp; {unit} {ports} {link} output s: bool = p.rsp_valid, registered;"
+        ))
+        .unwrap();
+        for (items, message) in [
+            (
+                format!("port p: Req => Rsp; {unit} {ports} request p(u.valid, u.req);"),
+                "needs `request` and `respond`",
+            ),
+            (
+                format!("port p: Req => Rsp; {unit} {ports} respond p(u.ready);"),
+                "needs `request` and `respond`",
+            ),
+            (
+                format!("port p: Req => Rsp; {unit} {ports} {link} request p(u.valid, u.req);"),
+                "already connected",
+            ),
+            (
+                format!(
+                    "port p: Req => Rsp; {unit} {ports} request p(u.valid); respond p(u.ready);"
+                ),
+                "expected `request",
+            ),
+            (
+                format!(
+                    "port p: Req => Rsp; {unit} {ports} request p(u.valid, u.req); respond p(u.ready, u.x);"
+                ),
+                "expected `respond",
+            ),
+            (
+                format!(
+                    "port p: Req => Rsp; {unit} {ports} request p(p.rsp_valid, u.req); respond p(u.ready);"
+                ),
+                "cannot drive a port",
+            ),
+            (
+                format!("port p: Req => Rsp; {unit} {ports} {link} request q(u.valid, u.req);"),
+                "not a declared `port`",
+            ),
+            (
+                format!("port p: Req => Rsp; {unit} {ports} {link} output s: bool = p.rsp_valid;"),
+                "only if it is `registered`",
+            ),
+            (
+                format!(
+                    "port p: Req => Rsp; unit u: S = f(I {{ state, r: p.req }}); {ports} {link}"
+                ),
+                "a port is read as",
+            ),
+            (
+                format!("port p: Req => Rsp; unit u: S = f(I {{ state, r: p }}); {ports} {link}"),
+                "a port is read as",
+            ),
+            (
+                format!("port p: Req => Rsp; port p: Req => Rsp; {unit} {ports} {link}"),
+                "duplicate name",
+            ),
+            ("port p: Req, Rsp;".to_string(), "expected `=>`"),
+        ] {
+            let err = check(&items).unwrap_err().to_string();
             assert!(err.contains(message), "{items}: {err}");
         }
     }

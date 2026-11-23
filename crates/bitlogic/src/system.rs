@@ -3,14 +3,21 @@
 //! Verilog.
 //!
 //! The `system!` macro generates a typed cycle model that uses the types here
-//! ([`Evaluate`], [`Memory`]) and a [`Design`] that [`Design::verilog`] turns
-//! into the core module, one registered wrapper per unit, the ROMs and the
-//! shared simple dual-port RAM.
+//! ([`Evaluate`], [`Memory`], [`Responder`]) and a [`Design`] that
+//! [`Design::verilog`] turns into the core module, one registered wrapper per
+//! unit, the ROMs and the shared simple dual-port RAM.
+//!
+//! A `port` connects the system to something outside it with variable
+//! latency, such as a DRAM controller behind clock-domain-crossing FIFOs: a
+//! request channel out and a response channel in, each with valid/ready
+//! handshakes that transfer on an edge where both are high. In the cycle
+//! model a [`Responder`] plays the other side; [`InOrder`] is a queue with
+//! configurable depth and latency.
 use crate::value::Schema;
 use crate::{BitVec, Error, Logic, LogicValue};
 use std::any::TypeId;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Write;
 
 fn fail<T>(message: impl Into<String>) -> Result<T, Error> {
@@ -135,6 +142,193 @@ pub enum Source {
     },
     /// A memory's registered read data.
     Rdata { memory: &'static str },
+    /// A port's signal from outside the system this cycle (unregistered).
+    Port {
+        name: &'static str,
+        signal: PortSignal,
+        path: Vec<&'static str>,
+    },
+}
+
+/// The signals a port brings into a system.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortSignal {
+    /// The other side accepts a request on this edge if one is valid.
+    ReqReady,
+    /// A response is offered on this edge.
+    RspValid,
+    /// The response offered (meaningful while `RspValid`).
+    Rsp,
+}
+
+/// A `port`: request and response types and what drives its outgoing
+/// signals (`request port(valid, data)` and `respond port(ready)`).
+pub struct PortSpec {
+    pub name: &'static str,
+    pub request: Schema,
+    pub response: Schema,
+    pub req_valid: Source,
+    pub req: Source,
+    pub rsp_ready: Source,
+}
+
+/// The other side of a `port` in a cycle model. Before each edge the model
+/// asks what the responder offers, evaluates the units (whose outgoing port
+/// signals may depend on it), then reports what transferred on the edge.
+/// What a responder offers must not depend on the system's signals in the
+/// same cycle, which is what makes the handshake free of combinational
+/// loops in hardware as well.
+pub trait Responder<Req, Rsp> {
+    /// A request valid this cycle is accepted on the edge.
+    fn req_ready(&self) -> bool;
+    /// The response offered this cycle, if any.
+    fn rsp(&self) -> Option<Rsp>;
+    /// The edge: the request that transferred (valid and ready), and whether
+    /// the offered response was consumed (valid and ready).
+    fn edge(&mut self, req: Option<Req>, rsp_taken: bool);
+}
+
+/// A responder that never accepts a request and never responds: every port
+/// of a new cycle model starts with one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Unconnected;
+
+impl<Req, Rsp> Responder<Req, Rsp> for Unconnected {
+    fn req_ready(&self) -> bool {
+        false
+    }
+    fn rsp(&self) -> Option<Rsp> {
+        None
+    }
+    fn edge(&mut self, _: Option<Req>, _: bool) {}
+}
+
+/// A port's signals during one cycle, as both sides saw them before the edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortCycle<Req, Rsp> {
+    pub req_valid: bool,
+    pub req: Req,
+    pub req_ready: bool,
+    pub rsp_valid: bool,
+    pub rsp: Rsp,
+    pub rsp_ready: bool,
+}
+
+impl<Req: LogicValue + Copy, Rsp: LogicValue + Copy> PortCycle<Req, Rsp> {
+    /// Every signal low or zero.
+    pub fn idle() -> Self {
+        Self {
+            req_valid: false,
+            req: Req::zeroed(),
+            req_ready: false,
+            rsp_valid: false,
+            rsp: Rsp::zeroed(),
+            rsp_ready: false,
+        }
+    }
+    /// The request transferred on the edge.
+    pub fn request(&self) -> Option<Req> {
+        (self.req_valid && self.req_ready).then_some(self.req)
+    }
+    /// The response consumed on the edge.
+    pub fn response(&self) -> Option<Rsp> {
+        (self.rsp_valid && self.rsp_ready).then_some(self.rsp)
+    }
+}
+
+/// Per-request latency of an [`InOrder`] responder: called once per accepted
+/// request.
+pub type Latency = Box<dyn FnMut() -> u64>;
+
+/// An in-order responder: up to `depth` requests in flight; each accepted
+/// request is answered by `serve` when it is accepted (so a memory model
+/// sees requests in order) and its response, if any, is offered `latency()`
+/// edges later (at least one), in acceptance order. Requests without a
+/// response (writes) still hold their place in the queue until their time,
+/// as an in-order controller would.
+pub struct InOrder<Req, Rsp> {
+    depth: usize,
+    latency: Latency,
+    serve: Box<dyn FnMut(Req) -> Option<Rsp>>,
+    /// `(edge at which it is due, response)` in acceptance order.
+    queue: VecDeque<(u64, Option<Rsp>)>,
+    edges: u64,
+    /// Requests accepted and responses consumed so far.
+    pub accepted: u64,
+    pub consumed: u64,
+}
+
+impl<Req, Rsp: Copy> InOrder<Req, Rsp> {
+    /// # Panics
+    /// When `depth` is zero.
+    pub fn new(
+        depth: usize,
+        latency: impl FnMut() -> u64 + 'static,
+        serve: impl FnMut(Req) -> Option<Rsp> + 'static,
+    ) -> Self {
+        assert!(
+            depth > 0,
+            "an in-order responder holds at least one request"
+        );
+        Self {
+            depth,
+            latency: Box::new(latency),
+            serve: Box::new(serve),
+            queue: VecDeque::new(),
+            edges: 0,
+            accepted: 0,
+            consumed: 0,
+        }
+    }
+
+    /// Requests accepted whose response has not been consumed yet.
+    pub fn in_flight(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Retire due requests that have no response.
+    fn retire(&mut self) {
+        while let Some(&(due, None)) = self.queue.front() {
+            if due > self.edges {
+                break;
+            }
+            self.queue.pop_front();
+        }
+    }
+}
+
+impl<Req, Rsp: Copy> Responder<Req, Rsp> for InOrder<Req, Rsp> {
+    fn req_ready(&self) -> bool {
+        self.queue.len() < self.depth
+    }
+    fn rsp(&self) -> Option<Rsp> {
+        match self.queue.front() {
+            Some(&(due, Some(rsp))) if due <= self.edges => Some(rsp),
+            _ => None,
+        }
+    }
+    fn edge(&mut self, req: Option<Req>, rsp_taken: bool) {
+        if rsp_taken {
+            let taken = self.queue.pop_front();
+            assert!(
+                matches!(taken, Some((due, Some(_))) if due <= self.edges),
+                "a response was consumed that was not offered"
+            );
+            self.consumed += 1;
+        }
+        self.edges += 1;
+        if let Some(req) = req {
+            assert!(
+                self.queue.len() < self.depth,
+                "a request was accepted while not ready"
+            );
+            let due = self.edges + (self.latency)().max(1) - 1;
+            let rsp = (self.serve)(req);
+            self.queue.push_back((due, rsp));
+            self.accepted += 1;
+        }
+        self.retire();
+    }
 }
 
 pub struct ParamSpec {
@@ -194,6 +388,7 @@ pub struct Design {
     pub units: Vec<UnitSpec>,
     pub writes: Vec<WriteSpec>,
     pub reads: Vec<ReadSpec>,
+    pub ports: Vec<PortSpec>,
 }
 
 /// A structured value in the generated core: its schema and one Verilog
@@ -420,6 +615,22 @@ impl Design {
                 };
                 (value, &[][..])
             }
+            Source::Port { name, signal, path } => {
+                let p = self.ports.iter().find(|p| p.name == *name);
+                let p = p.ok_or_else(|| Error(format!("{what}: no port `{name}`")))?;
+                let value = match signal {
+                    PortSignal::ReqReady => Value {
+                        schema: Schema::Bool,
+                        signals: vec![format!("{name}_req_ready")],
+                    },
+                    PortSignal::RspValid => Value {
+                        schema: Schema::Bool,
+                        signals: vec![format!("{name}_rsp_valid")],
+                    },
+                    PortSignal::Rsp => port_value(p, "rsp", &p.response),
+                };
+                (value, path.as_slice())
+            }
         };
         base.select(path, what)
     }
@@ -488,6 +699,7 @@ impl Design {
         let names = names.chain(self.outputs.iter().map(|o| o.name));
         let names = names.chain(self.memories.iter().map(|m| m.name));
         let names = names.chain(self.units.iter().map(|u| u.name));
+        let names = names.chain(self.ports.iter().map(|p| p.name));
         for name in names.chain([self.name]) {
             if !crate::ir::identifier(name)
                 || VERILOG_KEYWORDS.contains(&name)
@@ -535,6 +747,24 @@ impl Design {
             for (name, w) in value.signals.iter().zip(value.widths()?) {
                 ports.push(format!("output wire [{}:0] {name}", w - 1));
             }
+        }
+        for p in &self.ports {
+            let mut leaves = |dir: &str, value: Value| -> Result<(), Error> {
+                for (name, w) in value.signals.iter().zip(value.widths()?) {
+                    ports.push(format!("{dir} wire [{}:0] {name}", w - 1));
+                }
+                Ok(())
+            };
+            let flag = |name: String| Value {
+                schema: Schema::Bool,
+                signals: vec![name],
+            };
+            leaves("output", flag(format!("{}_req_valid", p.name)))?;
+            leaves("output", port_value(p, "req", &p.request))?;
+            leaves("input", flag(format!("{}_req_ready", p.name)))?;
+            leaves("input", flag(format!("{}_rsp_valid", p.name)))?;
+            leaves("input", port_value(p, "rsp", &p.response))?;
+            leaves("output", flag(format!("{}_rsp_ready", p.name)))?;
         }
 
         let mut text = format!(
@@ -612,6 +842,44 @@ impl Design {
             };
             for (port, value) in ports.signals.iter().zip(drive) {
                 writeln!(text, "    assign {port} = {value};").unwrap();
+            }
+        }
+
+        // Ports: the outgoing handshake signals, combinational.
+        for p in &self.ports {
+            let what = format!("port `{}`", p.name);
+            let drives = [
+                (
+                    &p.req_valid,
+                    Schema::Bool,
+                    vec![format!("{}_req_valid", p.name)],
+                    "request valid",
+                ),
+                (
+                    &p.req,
+                    p.request.clone(),
+                    port_value(p, "req", &p.request).signals,
+                    "request",
+                ),
+                (
+                    &p.rsp_ready,
+                    Schema::Bool,
+                    vec![format!("{}_rsp_ready", p.name)],
+                    "response ready",
+                ),
+            ];
+            for (source, schema, signals, role) in drives {
+                let what = format!("{what} {role}");
+                if matches!(source, Source::Port { .. }) {
+                    return fail(format!("{what}: a port cannot drive a port"));
+                }
+                let value = self.source(source, &what)?;
+                if value.schema != schema {
+                    return fail(format!("{what}: source type differs"));
+                }
+                for (port, v) in signals.iter().zip(&value.signals) {
+                    writeln!(text, "    assign {port} = {v};").unwrap();
+                }
             }
         }
         text.push_str("endmodule\n");
@@ -736,6 +1004,14 @@ impl Design {
         .unwrap();
         Ok(())
     }
+}
+
+/// A port's request (`req`) or response (`rsp`) leaves: `<port>_<dir>` for a
+/// scalar, else `<port>_<dir>_<path>`.
+fn port_value(p: &PortSpec, dir: &str, schema: &Schema) -> Value {
+    Value::named(schema.clone(), |path| {
+        leaf_name(&format!("{}_{dir}", p.name), path)
+    })
 }
 
 fn param_value(p: &ParamSpec) -> Value {
