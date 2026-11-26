@@ -423,6 +423,55 @@ Three injected bugs were each caught: a cycle model that transfers requests
 without `req_ready`, Verilog that wires `req_ready` to the response-valid
 port, and an `InOrder` that offers a response before its latency.
 
+## Clock domains (2026-11-26)
+
+`tests/clocks.rs` declares a FIFO across two domains (10 ns and 13.7 ns, so
+their edges never coincide): a producer in `a` writes `37 k + 11` for its
+`k`th value into a dual-clock RAM read in `b`, its write pointer crosses into
+`b` and the consumer's read pointer into `a` Gray-coded, a flag crosses as a
+level, and the consumer in `b` adds each value to a sum and an
+order-sensitive hash with a scale from a ROM in `b`.
+
+- Over 20,000 edges of bursty input, with no noise and with synchronizer
+  noise of 50 % and 100 %, the consumed stream equals the produced sequence
+  exactly (sum and hash against an integer reference written from the
+  sequence, more than 2,000 values each run), at most a ring's worth stays
+  unconsumed, and the flag crosses.
+- The native cycle model equals the IR-evaluated one on every output of
+  4,000 edges, with noise.
+- The generated Verilog under Icarus, with two free-running clocks and
+  resets released after the model's reset edges, equals the cycle model on
+  every output after each of 3,000 edges.
+- After every `b` edge the Gray-crossed write pointer is a value the
+  producer's pointer held in its last eight edges, with and without noise;
+  the same pointer crossed with `level` passes without noise and fails
+  under it.
+- A Gray crossing of a counter that steps by two panics on its first move.
+- The schedule orders edges (ties in clock order) and applies ppm.
+- The generated file list, the core's clock ports, each instance's clock and
+  the constraints file's lines are checked as text.
+
+The generated constraints were applied in Vivado 2025.2 (out of context,
+the two clocks created at 10 ns and 13.7 ns): each crossing and the
+dual-clock RAM got a datapath-only maximum delay of 10 ns and the Gray
+pointers a bus skew (0.77 ns of 10 ns), with no invalid object and no
+critical warning; `report_cdc` lists the flag as synchronized (CDC-3), the
+two Gray pointers as multi-bit synchronized (CDC-6, expected for Gray
+buses), the LUT RAM as a potential read/write collision (CDC-26, which the
+pointers rule out) and no unsafe crossing; setup timing was met.
+
+`bitlogic-macros` tests accept the declaration and reject 17 clocked ones:
+an item without `in`, an unknown clock, a unit, memory port or output using
+another domain's value or an input of another domain, a crossing into its own
+domain, from read data, of an unknown kind, into an unknown clock or without
+`into`, a duplicate clock, a memory port without `in`, `in` with no clock
+declared, a crossing with no clocks, and a period that is not a number.
+
+Two injected bugs were caught by the Icarus comparison: a model
+synchronizer of one flip-flop instead of two, and a dual-clock RAM written
+on its read clock. The one-clock path is unchanged: every earlier test
+passes, and arty_ethernet's trader core generates byte-identical Verilog.
+
 ## Build and CI
 
 `make emit` writes `build/select_logic.v`; `make example` prints the HDL example.

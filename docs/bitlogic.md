@@ -447,6 +447,74 @@ order; requests without a response (writes) keep their place. `Outputs` has
 a `PortCycle` per port with all six signals of the cycle before the edge,
 which is what a test replays against the generated Verilog.
 
+### Clock domains
+
+With `clock` items, a system has several clock domains. Each unit, input,
+output, `port` and memory port names its domain with `in`; a RAM written in
+one domain and read in another is a dual-clock RAM. Values move between
+domains only through a `cross`:
+
+```rust
+bitlogic::system! {
+    pub mod fifo {
+        clock a, period = 10.0;             // nominal period in ns (optional)
+        clock b, period = 13.7;
+        input ctl: Ctl in a, registered;
+        ram ring: Bits<8>, addr_bits = 4;   // written in a, read in b
+        unit prod: ProdState in a = produce(ProdIn { state, ctl, rd: rd_a });
+        unit cons: ConsState in b = consume(ConsIn { state, wr: wr_b, data: ring.rdata });
+        cross wr_b: Bits<4> = gray(prod.state.wr) into b;
+        cross rd_a: Bits<4> = gray(cons.state.rd) into a;
+        write ring(prod.we, prod.waddr, prod.wdata) in a;
+        read ring(cons.raddr) in b;
+        output sum: Bits<16> in b = cons.state.sum;
+    }
+}
+```
+
+The macro checks that every connection stays in its consumer's domain (a
+param is in every domain): a unit, output or memory port that names a value
+of another domain is a compile error pointing at it. A crossing carries a
+unit's state or an input (one `Bits` or `bool` value) from its domain into
+another:
+
+- `gray(...)`: a counter that moves by at most one (up or down, wrapping) per
+  source edge, at most 64 bits. It crosses Gray-coded, so the destination
+  sees either the value before a move or the one after it.
+- `level(...)`: bits synchronized one by one, for flags and quasi-static
+  values; while a multi-bit value changes, its bits may arrive a
+  destination edge apart.
+
+Either is a register in the source domain, then two synchronizer flip-flops
+in the destination domain, which sees the second: a value arrives one source
+edge and two destination edges after it is set.
+
+The cycle model gains `enum Clock` (`Clock::ALL`, `name`, `period_ns`,
+`schedule(ppm)`); `Core::new` resets every domain twice, `tick(clock,
+inputs)` advances one edge of one domain and `reset(clock, inputs)` one with
+that domain's reset asserted. Drive the edges in time order, for example
+from `bitlogic::system::Schedule` (free-running clocks with periods and
+phases in femtoseconds; `Schedule::period_fs(ns, ppm)`). Each crossing is
+modelled register for register (`Core::__cross_<name>`); a Gray source that
+moves by more than one in a source edge panics, naming the crossing.
+`Core::cdc_noise` (`CdcNoise::new(seed, percent)`, off by default) samples a
+value that changed since the destination's last edge, bit by bit at random,
+as it was before the change, as a metastable first flip-flop may resolve: a
+design that is correct under noise does not depend on when a crossing
+resolves.
+
+In Verilog the core has `clk_<clock>` and `rst_<clock>` ports (synchronous
+resets, one per domain) instead of `clk` and `rst`; every unit, boundary
+register, memory port and ROM is clocked in its domain, crossings use
+`bitlogic_cdc_gray` / `bitlogic_cdc_level` (`bitlogic_cdc.v`, plain Verilog
+with `ASYNC_REG`), and dual-clock RAMs `bitlogic_dc_ram`. `verilog()` also
+returns `<system>_cdc.tcl`, to read with `read_xdc -unmanaged` once the
+clocks exist: a datapath-only maximum delay of the faster clock's period
+from each crossing's source register to its first flip-flop (with a bus
+skew for a multi-bit Gray crossing) and from each dual-clock RAM's cells to
+its read register. The system's domains must not be in asynchronous clock
+groups, which would override these constraints.
+
 ## HDL integration
 
 Ports use `i_`/`o_` prefixes. A nested path `state.counter` becomes `i_state_counter`

@@ -118,6 +118,231 @@ impl<T: LogicValue + Copy> Memory<T> {
     }
 }
 
+/// What a `cross` carries between clock domains, and how.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CrossKind {
+    /// A counter that moves by at most one (up or down, wrapping) per source
+    /// edge, Gray-coded across: the destination sees either the value
+    /// before a move or the one after it, never a mixture.
+    Gray,
+    /// Bits synchronized one by one (a level, a flag, a quasi-static value):
+    /// while a value changes, each bit may arrive a destination edge apart.
+    Level,
+}
+
+/// Synchronizer noise for a cycle model's crossings: with probability
+/// `percent` / 100, a value that changed since the destination's last edge
+/// is sampled, bit by bit at random, as it was before the change, as a
+/// metastable first flip-flop may resolve. Off by default.
+#[derive(Clone, Debug, Default)]
+pub struct CdcNoise {
+    state: u64,
+    percent: u8,
+}
+
+impl CdcNoise {
+    pub fn new(seed: u64, percent: u8) -> Self {
+        Self {
+            state: seed | 1,
+            percent: percent.min(100),
+        }
+    }
+    fn next(&mut self) -> u64 {
+        // xorshift64*
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn fires(&mut self) -> bool {
+        self.percent != 0 && self.next() % 100 < u64::from(self.percent)
+    }
+}
+
+/// One `cross` in a cycle model, register for register as the generated
+/// Verilog: a source register (Gray-coded for [`CrossKind::Gray`]) clocked
+/// in the source domain, then two synchronizer flip-flops in the
+/// destination domain; the destination sees the second.
+#[derive(Clone, Debug)]
+pub struct Crossing<T> {
+    name: &'static str,
+    kind: CrossKind,
+    /// Source register (Gray code for `Gray`) and its value before the last
+    /// source edge that changed it.
+    src: Vec<BitVec>,
+    prev: Vec<BitVec>,
+    /// The source register changed since the destination's last edge.
+    fresh: bool,
+    s1: Vec<BitVec>,
+    s2: Vec<BitVec>,
+    _value: std::marker::PhantomData<T>,
+}
+
+fn gray_of(v: &BitVec) -> BitVec {
+    let w = v.words();
+    let shifted: Vec<u64> = (0..w.len())
+        .map(|i| (w[i] >> 1) | (w.get(i + 1).copied().unwrap_or(0) << 63))
+        .collect();
+    BitVec::from_words(
+        &w.iter()
+            .zip(&shifted)
+            .map(|(a, b)| a ^ b)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn binary_of(g: &BitVec, width: u16) -> BitVec {
+    // Bit i of the binary value is the XOR of Gray bits i and above.
+    let mut words = vec![0u64; crate::bitvec::words_for(usize::from(width))];
+    let mut acc = false;
+    for i in (0..usize::from(width)).rev() {
+        acc ^= g.bit(i);
+        if acc {
+            words[i / 64] |= 1 << (i % 64);
+        }
+    }
+    BitVec::from_words(&words)
+}
+
+impl<T: LogicValue + Copy> Crossing<T> {
+    /// Panics if a [`CrossKind::Gray`] crossing does not carry a single
+    /// `Bits` value of at most 64 bits.
+    pub fn new(name: &'static str, kind: CrossKind) -> Self {
+        let zero = T::zeroed().flatten();
+        if kind == CrossKind::Gray {
+            let width = T::schema().width().unwrap_or(0);
+            assert!(
+                zero.len() == 1 && (1..=64).contains(&width),
+                "cross `{name}`: a Gray crossing carries one Bits value of 1 to 64 bits"
+            );
+        }
+        Self {
+            name,
+            kind,
+            src: zero.clone(),
+            prev: zero.clone(),
+            fresh: false,
+            s1: zero.clone(),
+            s2: zero,
+            _value: std::marker::PhantomData,
+        }
+    }
+
+    /// A source-domain edge: the source register takes `next` (zero with
+    /// `rst`). Panics when a Gray crossing's value moves by more than one.
+    pub fn source_edge(&mut self, next: T, rst: bool) {
+        let mut leaves = next.flatten();
+        if rst {
+            leaves = T::zeroed().flatten();
+        } else if self.kind == CrossKind::Gray {
+            let width = T::schema().width().expect("checked in new");
+            let old = binary_of(&self.src[0], width)
+                .to_u64()
+                .expect("at most 64 bits");
+            let new = leaves[0].to_u64().expect("at most 64 bits");
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1 << width) - 1
+            };
+            let step = new.wrapping_sub(old) & mask;
+            assert!(
+                step == 0 || step == 1 || step == mask,
+                "cross `{}`: a Gray crossing's value moved from {old} to {new} in one \
+                 source edge (at most one step at a time)",
+                self.name
+            );
+        }
+        if self.kind == CrossKind::Gray {
+            leaves = leaves.iter().map(gray_of).collect();
+        }
+        if leaves != self.src {
+            self.prev = std::mem::replace(&mut self.src, leaves);
+            self.fresh = true;
+        }
+    }
+
+    /// A destination-domain edge: the synchronizer shifts (zero with `rst`).
+    pub fn dest_edge(&mut self, rst: bool, noise: &mut CdcNoise) {
+        if rst {
+            self.s1 = T::zeroed().flatten();
+            self.s2 = self.s1.clone();
+            return;
+        }
+        let mut sample = self.src.clone();
+        if self.fresh && noise.fires() {
+            for (bits, old) in sample.iter_mut().zip(&self.prev) {
+                let words: Vec<u64> = bits
+                    .words()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &new)| {
+                        let keep = noise.next();
+                        let old = old.words().get(i).copied().unwrap_or(0);
+                        (new & !keep) | (old & keep)
+                    })
+                    .collect();
+                *bits = BitVec::from_words(&words);
+            }
+        }
+        self.fresh = false;
+        self.s2 = std::mem::replace(&mut self.s1, sample);
+    }
+
+    /// What the destination sees: the second synchronizer flip-flop.
+    pub fn value(&self) -> T {
+        let leaves = if self.kind == CrossKind::Gray {
+            let width = T::schema().width().expect("checked in new");
+            vec![binary_of(&self.s2[0], width)]
+        } else {
+            self.s2.clone()
+        };
+        T::read(&mut leaves.into_iter()).expect("same schema")
+    }
+}
+
+/// Rising edges of several free-running clocks in time order, for driving a
+/// multi-clock cycle model: each clock has a period and a phase (the time
+/// of its first edge), in femtoseconds. Edges at the same time come in
+/// clock order.
+#[derive(Clone, Debug)]
+pub struct Schedule {
+    periods: Vec<u64>,
+    next: Vec<u64>,
+}
+
+impl Schedule {
+    /// `clocks`: `(period, phase)` in femtoseconds.
+    pub fn new(clocks: &[(u64, u64)]) -> Self {
+        assert!(
+            clocks.iter().all(|&(p, _)| p > 0),
+            "periods must be positive"
+        );
+        Self {
+            periods: clocks.iter().map(|c| c.0).collect(),
+            next: clocks.iter().map(|c| c.1).collect(),
+        }
+    }
+
+    /// A period in femtoseconds from one in nanoseconds, off by `ppm` parts
+    /// per million (positive: slower).
+    pub fn period_fs(ns: f64, ppm: f64) -> u64 {
+        (ns * 1e6 * (1.0 + ppm * 1e-6)).round() as u64
+    }
+}
+
+impl Iterator for Schedule {
+    /// `(time in femtoseconds, clock index)`.
+    type Item = (u64, usize);
+    fn next(&mut self) -> Option<(u64, usize)> {
+        let (i, &t) = self.next.iter().enumerate().min_by_key(|&(i, &t)| (t, i))?;
+        self.next[i] = t + self.periods[i];
+        Some((t, i))
+    }
+}
+
 /// Where a connection's value comes from. Paths select struct fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -148,6 +373,8 @@ pub enum Source {
         signal: PortSignal,
         path: Vec<&'static str>,
     },
+    /// A `cross`'s value in its destination domain.
+    Cross { name: &'static str },
 }
 
 /// The signals a port brings into a system.
@@ -165,6 +392,8 @@ pub enum PortSignal {
 /// signals (`request port(valid, data)` and `respond port(ready)`).
 pub struct PortSpec {
     pub name: &'static str,
+    /// The port's clock domain (`None` in a system with one clock).
+    pub clock: Option<&'static str>,
     pub request: Schema,
     pub response: Schema,
     pub req_valid: Source,
@@ -339,12 +568,14 @@ pub struct ParamSpec {
 
 pub struct InputSpec {
     pub name: &'static str,
+    pub clock: Option<&'static str>,
     pub schema: Schema,
     pub registered: bool,
 }
 
 pub struct OutputSpec {
     pub name: &'static str,
+    pub clock: Option<&'static str>,
     pub schema: Schema,
     pub source: Source,
     pub registered: bool,
@@ -385,6 +616,7 @@ impl RamStyle {
 
 pub struct UnitSpec {
     pub name: &'static str,
+    pub clock: Option<&'static str>,
     pub logic: Logic,
     pub state: Schema,
     /// Input struct fields other than `state`, and what drives them.
@@ -393,6 +625,7 @@ pub struct UnitSpec {
 
 pub struct WriteSpec {
     pub memory: &'static str,
+    pub clock: Option<&'static str>,
     pub enable: Source,
     pub address: Source,
     pub data: Source,
@@ -400,7 +633,26 @@ pub struct WriteSpec {
 
 pub struct ReadSpec {
     pub memory: &'static str,
+    pub clock: Option<&'static str>,
     pub address: Source,
+}
+
+/// A `clock` domain: its name and nominal period (for the cycle model's
+/// default schedule; the constraints take periods from the clocks Vivado
+/// knows).
+pub struct ClockSpec {
+    pub name: &'static str,
+    pub period_ns: Option<f64>,
+}
+
+/// A `cross`: `source`, in domain `from`, synchronized into domain `to`.
+pub struct CrossSpec {
+    pub name: &'static str,
+    pub kind: CrossKind,
+    pub schema: Schema,
+    pub source: Source,
+    pub from: &'static str,
+    pub to: &'static str,
 }
 
 /// A whole `system!` declaration, as data for the Verilog backend.
@@ -414,6 +666,10 @@ pub struct Design {
     pub writes: Vec<WriteSpec>,
     pub reads: Vec<ReadSpec>,
     pub ports: Vec<PortSpec>,
+    /// Empty for a system with one clock (ports `clk` and `rst`); else
+    /// ports `clk_<name>` and `rst_<name>` per domain.
+    pub clocks: Vec<ClockSpec>,
+    pub crossings: Vec<CrossSpec>,
 }
 
 /// A structured value in the generated core: its schema and one Verilog
@@ -656,8 +912,79 @@ impl Design {
                 };
                 (value, path.as_slice())
             }
+            Source::Cross { name } => {
+                let c = self.crossing(name, what)?;
+                let value = Value {
+                    schema: c.schema.clone(),
+                    signals: vec![format!("{name}_sync")],
+                };
+                (value, &[][..])
+            }
         };
         base.select(path, what)
+    }
+
+    fn crossing(&self, name: &str, what: &str) -> Result<&CrossSpec, Error> {
+        self.crossings
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| Error(format!("{what}: no crossing `{name}`")))
+    }
+
+    /// The clock domain a source belongs to: `Ok(None)` for a param (any
+    /// domain); in a system with one clock every other source is in
+    /// `Some(None)`.
+    fn domain(&self, source: &Source, what: &str) -> Result<Option<Option<&'static str>>, Error> {
+        Ok(Some(match source {
+            Source::Param { .. } => return Ok(None),
+            Source::Input { name, .. } => {
+                let i = self.inputs.iter().find(|i| i.name == *name);
+                i.ok_or_else(|| Error(format!("{what}: no input `{name}`")))?
+                    .clock
+            }
+            Source::State { unit, .. } | Source::Output { unit, .. } => {
+                let u = self.units.iter().find(|u| u.name == *unit);
+                u.ok_or_else(|| Error(format!("{what}: no unit `{unit}`")))?
+                    .clock
+            }
+            Source::Rdata { memory } => {
+                let r = self.reads.iter().find(|r| r.memory == *memory);
+                r.ok_or_else(|| Error(format!("{what}: no read port of `{memory}`")))?
+                    .clock
+            }
+            Source::Port { name, .. } => {
+                let p = self.ports.iter().find(|p| p.name == *name);
+                p.ok_or_else(|| Error(format!("{what}: no port `{name}`")))?
+                    .clock
+            }
+            Source::Cross { name } => Some(self.crossing(name, what)?.to),
+        }))
+    }
+
+    /// `source` must be in `clock` (or be a param).
+    fn same_domain(
+        &self,
+        source: &Source,
+        clock: Option<&'static str>,
+        what: &str,
+    ) -> Result<(), Error> {
+        match self.domain(source, what)? {
+            Some(d) if d != clock => fail(format!(
+                "{what}: its source is in clock domain `{}`, not `{}` (cross it with a \
+                 `cross`)",
+                d.unwrap_or("-"),
+                clock.unwrap_or("-")
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// The clock and reset signals of a domain.
+    fn clock_signals(&self, clock: Option<&str>) -> (String, String) {
+        match clock {
+            Some(d) => (format!("clk_{d}"), format!("rst_{d}")),
+            None => ("clk".into(), "rst".into()),
+        }
     }
 
     fn memory(&self, name: &str, what: &str) -> Result<&MemorySpec, Error> {
@@ -711,10 +1038,76 @@ impl Design {
                 files.push((format!("{module}.v"), rom_verilog(&module, m, contents)?));
             }
         }
-        if self.memories.iter().any(|m| m.contents.is_none()) {
+        if self
+            .memories
+            .iter()
+            .any(|m| m.contents.is_none() && !self.two_clocks(m))
+        {
             files.push(("bitlogic_sdp_ram.v".into(), SDP_RAM.into()));
         }
+        if self.memories.iter().any(|m| self.two_clocks(m)) {
+            files.push(("bitlogic_dc_ram.v".into(), DC_RAM.into()));
+        }
+        if !self.crossings.is_empty() {
+            files.push(("bitlogic_cdc.v".into(), CDC.into()));
+        }
+        if !self.clocks.is_empty() {
+            files.push((format!("{}_cdc.tcl", self.name), self.cdc_constraints()?));
+        }
         Ok(files)
+    }
+
+    /// A RAM whose write and read ports are in different clock domains.
+    fn two_clocks(&self, m: &MemorySpec) -> bool {
+        let w = self.writes.iter().find(|w| w.memory == m.name);
+        let r = self.reads.iter().find(|r| r.memory == m.name);
+        matches!((w, r), (Some(w), Some(r)) if w.clock != r.clock)
+    }
+
+    /// Timing constraints for every crossing and every RAM written in one
+    /// clock domain and read in another, as Tcl for `read_xdc -unmanaged`:
+    /// a datapath-only maximum delay (and, for a Gray crossing, a bus skew)
+    /// of the faster clock's period, from the source registers to the first
+    /// synchronizer flip-flops; the periods come from the clocks Vivado
+    /// knows at that point.
+    fn cdc_constraints(&self) -> Result<String, Error> {
+        let mut text = format!(
+            "# Generated by bitlogic from `system!` `{}`; do not edit.\n\
+             # Read with `read_xdc -unmanaged` after the clocks are created. The\n\
+             # system's clock domains must not be in asynchronous clock groups\n\
+             # (they would override these constraints).\n\
+             proc bitlogic_cdc {{from_pattern to_pattern skew}} {{\n    \
+             set leaf {{IS_PRIMITIVE && PRIMITIVE_LEVEL != MACRO}}\n    \
+             set from [get_cells -quiet -hierarchical -filter \"NAME =~ $from_pattern && $leaf\"]\n    \
+             set to [get_cells -quiet -hierarchical -filter \"NAME =~ $to_pattern && $leaf\"]\n    \
+             if {{[llength $from] == 0 || [llength $to] == 0}} {{ return }}\n    \
+             set pins [get_pins -quiet -of_objects [concat $from $to] -filter {{IS_CLOCK}}]\n    \
+             set periods [lsort -real [get_property PERIOD [get_clocks -quiet -of_objects $pins]]]\n    \
+             if {{[llength $periods] == 0}} {{ return }}\n    \
+             set period [lindex $periods 0]\n    \
+             set_max_delay -datapath_only -from $from -to $to $period\n    \
+             if {{$skew}} {{ set_bus_skew -from $from -to $to $period }}\n\
+             }}\n",
+            self.name
+        );
+        for c in &self.crossings {
+            let skew = u8::from(c.kind == CrossKind::Gray && c.schema.width()? > 1);
+            writeln!(
+                text,
+                "bitlogic_cdc {{*{n}_cross_i/src_q_reg*}} {{*{n}_cross_i/s1_reg*}} {skew}",
+                n = c.name
+            )
+            .unwrap();
+        }
+        for m in self.memories.iter().filter(|m| self.two_clocks(m)) {
+            writeln!(
+                text,
+                "bitlogic_cdc {{*{n}_i/*mem_reg*}} {{*{n}_i/*rdata_reg*}} 0",
+                n = m.name
+            )
+            .unwrap();
+        }
+        Ok(text)
     }
 
     fn check_names(&self) -> Result<(), Error> {
@@ -725,6 +1118,15 @@ impl Design {
         let names = names.chain(self.memories.iter().map(|m| m.name));
         let names = names.chain(self.units.iter().map(|u| u.name));
         let names = names.chain(self.ports.iter().map(|p| p.name));
+        let names = names.chain(self.crossings.iter().map(|c| c.name));
+        // Clock names have their own namespace (a unit may share its
+        // domain's name): they become `clk_<name>` and `rst_<name>`.
+        let mut clocks = BTreeSet::new();
+        for c in &self.clocks {
+            if !crate::ir::identifier(c.name) || !clocks.insert(c.name) {
+                return fail(format!("invalid or duplicate clock `{}`", c.name));
+            }
+        }
         for name in names.chain([self.name]) {
             if !crate::ir::identifier(name)
                 || VERILOG_KEYWORDS.contains(&name)
@@ -749,6 +1151,85 @@ impl Design {
                 ));
             }
         }
+        self.check_domains()
+    }
+
+    /// Every clocked item names a declared domain (or none, with one
+    /// clock), every connection stays in its consumer's domain, and every
+    /// crossing goes from one domain to another.
+    fn check_domains(&self) -> Result<(), Error> {
+        let declared = |clock: Option<&str>, what: &str| -> Result<(), Error> {
+            let ok = match clock {
+                None => self.clocks.is_empty(),
+                Some(d) => self.clocks.iter().any(|c| c.name == d),
+            };
+            if ok {
+                Ok(())
+            } else {
+                fail(format!("{what}: needs one of the system's clock domains"))
+            }
+        };
+        for u in &self.units {
+            let what = format!("unit `{}`", u.name);
+            declared(u.clock, &what)?;
+            for (field, source) in &u.connections {
+                self.same_domain(source, u.clock, &format!("{what} field `{field}`"))?;
+            }
+        }
+        for i in &self.inputs {
+            declared(i.clock, &format!("input `{}`", i.name))?;
+        }
+        for o in &self.outputs {
+            let what = format!("output `{}`", o.name);
+            declared(o.clock, &what)?;
+            self.same_domain(&o.source, o.clock, &what)?;
+        }
+        for w in &self.writes {
+            let what = format!("memory `{}` write port", w.memory);
+            declared(w.clock, &what)?;
+            for s in [&w.enable, &w.address, &w.data] {
+                self.same_domain(s, w.clock, &what)?;
+            }
+        }
+        for r in &self.reads {
+            let what = format!("memory `{}` read port", r.memory);
+            declared(r.clock, &what)?;
+            self.same_domain(&r.address, r.clock, &what)?;
+        }
+        for p in &self.ports {
+            let what = format!("port `{}`", p.name);
+            declared(p.clock, &what)?;
+            for s in [&p.req_valid, &p.req, &p.rsp_ready] {
+                self.same_domain(s, p.clock, &what)?;
+            }
+        }
+        for c in &self.crossings {
+            let what = format!("crossing `{}`", c.name);
+            if self.clocks.is_empty() {
+                return fail(format!(
+                    "{what}: a system with one clock has nothing to cross"
+                ));
+            }
+            declared(Some(c.from), &what)?;
+            declared(Some(c.to), &what)?;
+            if c.from == c.to {
+                return fail(format!("{what}: crosses from `{}` into itself", c.to));
+            }
+            self.same_domain(&c.source, Some(c.from), &what)?;
+            if !matches!(c.source, Source::State { .. } | Source::Input { .. }) {
+                return fail(format!("{what}: crosses a unit's state or an input"));
+            }
+            let width = c.schema.width()?;
+            let leaves = c.schema.leaves().len();
+            if leaves != 1 || (c.kind == CrossKind::Gray && width > 64) {
+                return fail(format!(
+                    "{what}: crosses one Bits or bool value (a Gray one of at most 64 bits)"
+                ));
+            }
+            if self.source(&c.source, &what)?.schema != c.schema {
+                return fail(format!("{what}: source type differs"));
+            }
+        }
         Ok(())
     }
 
@@ -760,7 +1241,16 @@ impl Design {
                 params.push(format!("parameter [{}:0] {name} = {}", w - 1, hex(w, v)));
             }
         }
-        let mut ports = vec!["input wire clk".to_string(), "input wire rst".to_string()];
+        let mut ports = Vec::new();
+        if self.clocks.is_empty() {
+            ports.push("input wire clk".to_string());
+            ports.push("input wire rst".to_string());
+        }
+        for c in &self.clocks {
+            let (clk, rst) = self.clock_signals(Some(c.name));
+            ports.push(format!("input wire {clk}"));
+            ports.push(format!("input wire {rst}"));
+        }
         for i in &self.inputs {
             let value = Value::named(i.schema.clone(), |path| leaf_name(i.name, path));
             for (name, w) in value.signals.iter().zip(value.widths()?) {
@@ -806,7 +1296,8 @@ impl Design {
         for i in self.inputs.iter().filter(|i| i.registered) {
             let raw = Value::named(i.schema.clone(), |path| leaf_name(i.name, path));
             let reg = input_value(i);
-            registers(&mut text, &reg, &raw.signals)?;
+            let (clk, rst) = self.clock_signals(i.clock);
+            registers(&mut text, &reg, &raw.signals, &clk, &rst)?;
         }
 
         // Units: registered state and combinational outputs, then instances.
@@ -827,11 +1318,40 @@ impl Design {
             )
             .unwrap();
         }
+        for c in &self.crossings {
+            writeln!(
+                text,
+                "    wire [{}:0] {}_sync;",
+                c.schema.width()? - 1,
+                c.name
+            )
+            .unwrap();
+        }
         for u in &self.units {
             self.instance(&mut text, u)?;
         }
         for m in &self.memories {
             self.memory_instance(&mut text, m)?;
+        }
+        for c in &self.crossings {
+            let what = format!("crossing `{}`", c.name);
+            let source = self.source(&c.source, &what)?;
+            let (sclk, srst) = self.clock_signals(Some(c.from));
+            let (dclk, drst) = self.clock_signals(Some(c.to));
+            let module = match c.kind {
+                CrossKind::Gray => "bitlogic_cdc_gray",
+                CrossKind::Level => "bitlogic_cdc_level",
+            };
+            writeln!(
+                text,
+                "    {module} #(.W({w})) {n}_cross_i (\n        \
+                 .src_clk({sclk}), .src_rst({srst}), .src_in({src}),\n        \
+                 .dest_clk({dclk}), .dest_rst({drst}), .dest_out({n}_sync)\n    );",
+                w = c.schema.width()?,
+                n = c.name,
+                src = source.scalar(c.schema.width()?, &what)?,
+            )
+            .unwrap();
         }
 
         // Outputs, registered or not.
@@ -860,7 +1380,8 @@ impl Design {
                     signals: ports.signals.iter().map(|s| format!("{s}_q")).collect(),
                     ..ports.clone()
                 };
-                registers(&mut text, &reg, &source.signals)?;
+                let (clk, rst) = self.clock_signals(o.clock);
+                registers(&mut text, &reg, &source.signals, &clk, &rst)?;
                 reg.signals
             } else {
                 source.signals
@@ -969,9 +1490,10 @@ impl Design {
             let s = state_output(port).expect("a state port");
             bindings.push(format!(".{s}({wire})"));
         }
+        let (clk, rst) = self.clock_signals(u.clock);
         writeln!(
             text,
-            "    {name}_unit {name}_i (\n        .clk(clk), .rst(rst),\n        {}\n    );",
+            "    {name}_unit {name}_i (\n        .clk({clk}), .rst({rst}),\n        {}\n    );",
             bindings.join(",\n        "),
             name = u.name
         )
@@ -996,10 +1518,11 @@ impl Design {
             .expect("checked");
         let raddr = self.source(&read.address, &format!("{what} read address"))?;
         let raddr = raddr.scalar(addr, &what)?;
+        let (rclk, _) = self.clock_signals(read.clock);
         if m.contents.is_some() {
             writeln!(
                 text,
-                "    {name}_rom {name}_i (.clk(clk), .addr({raddr}), .data({name}_rdata));",
+                "    {name}_rom {name}_i (.clk({rclk}), .addr({raddr}), .data({name}_rdata));",
                 name = m.name
             )
             .unwrap();
@@ -1016,10 +1539,16 @@ impl Design {
         if wdata.schema != m.element {
             return fail(format!("{what}: write data type differs"));
         }
+        let (wclk, _) = self.clock_signals(write.clock);
+        let (module, clocks) = if self.two_clocks(m) {
+            ("bitlogic_dc_ram", format!(".wclk({wclk}), .rclk({rclk})"))
+        } else {
+            ("bitlogic_sdp_ram", format!(".clk({rclk})"))
+        };
         writeln!(
             text,
-            "    bitlogic_sdp_ram #(.ADDR_W({addr}), .DATA_W({width}){style}) {name}_i (\n        \
-             .clk(clk), .we({}), .waddr({}), .wdata({}),\n        \
+            "    {module} #(.ADDR_W({addr}), .DATA_W({width}){style}) {name}_i (\n        \
+             {clocks}, .we({}), .waddr({}), .wdata({}),\n        \
              .raddr({raddr}), .rdata({name}_rdata)\n    );",
             we.scalar(1, &what)?,
             waddr.scalar(addr, &what)?,
@@ -1093,7 +1622,13 @@ fn unit_values(u: &UnitSpec) -> Result<(Value, Value), Error> {
 }
 
 /// Registers `reg` <= `next`, reset to zero.
-fn registers(text: &mut String, reg: &Value, next: &[String]) -> Result<(), Error> {
+fn registers(
+    text: &mut String,
+    reg: &Value,
+    next: &[String],
+    clk: &str,
+    rst: &str,
+) -> Result<(), Error> {
     for (name, w) in reg.signals.iter().zip(reg.widths()?) {
         writeln!(
             text,
@@ -1103,7 +1638,11 @@ fn registers(text: &mut String, reg: &Value, next: &[String]) -> Result<(), Erro
         )
         .unwrap();
     }
-    text.push_str("    always @(posedge clk) begin\n        if (rst) begin\n");
+    writeln!(
+        text,
+        "    always @(posedge {clk}) begin\n        if ({rst}) begin"
+    )
+    .unwrap();
     for (name, w) in reg.signals.iter().zip(reg.widths()?) {
         writeln!(text, "            {name} <= {};", hex(w, &BitVec::zero())).unwrap();
     }
@@ -1205,6 +1744,138 @@ module bitlogic_sdp_ram #(
             end
         end
     endgenerate
+endmodule
+";
+
+const DC_RAM: &str = "// Generated by bitlogic; do not edit.
+`timescale 1ns / 1ps
+
+// Simple dual-port RAM with a clock per port: the write port on `wclk`, the
+// always-enabled read port on `rclk` (a RAM written in one clock domain and
+// read in another).
+// Read data is registered (one `rclk` cycle of latency); a read of an address
+// being written in the other domain is undefined (the design must not). Contents start at
+// zero. STYLE is Vivado's ram_style: \"auto\" (block RAM for large instances,
+// LUT RAM for small ones), \"distributed\" (LUT RAM, the read register in the
+// fabric) or \"block\".
+module bitlogic_dc_ram #(
+    parameter ADDR_W = 11,
+    parameter DATA_W = 8,
+    parameter STYLE = \"auto\"
+) (
+    input  wire              wclk,
+    input  wire              rclk,
+    input  wire              we,
+    input  wire [ADDR_W-1:0] waddr,
+    input  wire [DATA_W-1:0] wdata,
+    input  wire [ADDR_W-1:0] raddr,
+    output reg  [DATA_W-1:0] rdata
+);
+    initial rdata = {DATA_W{1'b0}};
+    generate
+        if (STYLE == \"distributed\") begin : g
+            (* ram_style = \"distributed\" *) reg [DATA_W-1:0] mem [0:(1 << ADDR_W) - 1];
+            integer i;
+            initial
+                for (i = 0; i < (1 << ADDR_W); i = i + 1)
+                    mem[i] = {DATA_W{1'b0}};
+            always @(posedge wclk)
+                if (we)
+                    mem[waddr] <= wdata;
+            always @(posedge rclk)
+                rdata <= mem[raddr];
+        end else if (STYLE == \"block\") begin : g
+            (* ram_style = \"block\" *) reg [DATA_W-1:0] mem [0:(1 << ADDR_W) - 1];
+            integer i;
+            initial
+                for (i = 0; i < (1 << ADDR_W); i = i + 1)
+                    mem[i] = {DATA_W{1'b0}};
+            always @(posedge wclk)
+                if (we)
+                    mem[waddr] <= wdata;
+            always @(posedge rclk)
+                rdata <= mem[raddr];
+        end else begin : g
+            reg [DATA_W-1:0] mem [0:(1 << ADDR_W) - 1];
+            integer i;
+            initial
+                for (i = 0; i < (1 << ADDR_W); i = i + 1)
+                    mem[i] = {DATA_W{1'b0}};
+            always @(posedge wclk)
+                if (we)
+                    mem[waddr] <= wdata;
+            always @(posedge rclk)
+                rdata <= mem[raddr];
+        end
+    endgenerate
+endmodule
+";
+
+const CDC: &str = "// Generated by bitlogic; do not edit.
+`timescale 1ns / 1ps
+
+// Clock-domain crossings of `system!` `cross` items: a source register in the
+// source domain, then two synchronizer flip-flops (ASYNC_REG) in the
+// destination domain, which sees the second. The generated `<system>_cdc.tcl`
+// constrains each source-to-first-flip-flop path.
+
+// A counter that moves by at most one per source edge, crossed Gray-coded.
+module bitlogic_cdc_gray #(
+    parameter W = 4
+) (
+    input  wire         src_clk,
+    input  wire         src_rst,
+    input  wire [W-1:0] src_in,
+    input  wire         dest_clk,
+    input  wire         dest_rst,
+    output wire [W-1:0] dest_out
+);
+    reg [W-1:0] src_q = {W{1'b0}};
+    (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s1_reg = {W{1'b0}};
+    (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s2_reg = {W{1'b0}};
+    always @(posedge src_clk)
+        src_q <= src_rst ? {W{1'b0}} : (src_in ^ (src_in >> 1));
+    always @(posedge dest_clk)
+        if (dest_rst) begin
+            s1_reg <= {W{1'b0}};
+            s2_reg <= {W{1'b0}};
+        end else begin
+            s1_reg <= src_q;
+            s2_reg <= s1_reg;
+        end
+    genvar i;
+    generate
+        for (i = 0; i < W; i = i + 1) begin : bin
+            assign dest_out[i] = ^s2_reg[W-1:i];
+        end
+    endgenerate
+endmodule
+
+// Bits synchronized one by one.
+module bitlogic_cdc_level #(
+    parameter W = 1
+) (
+    input  wire         src_clk,
+    input  wire         src_rst,
+    input  wire [W-1:0] src_in,
+    input  wire         dest_clk,
+    input  wire         dest_rst,
+    output wire [W-1:0] dest_out
+);
+    reg [W-1:0] src_q = {W{1'b0}};
+    (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s1_reg = {W{1'b0}};
+    (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s2_reg = {W{1'b0}};
+    always @(posedge src_clk)
+        src_q <= src_rst ? {W{1'b0}} : src_in;
+    always @(posedge dest_clk)
+        if (dest_rst) begin
+            s1_reg <= {W{1'b0}};
+            s2_reg <= {W{1'b0}};
+        end else begin
+            s1_reg <= src_q;
+            s2_reg <= s1_reg;
+        end
+    assign dest_out = s2_reg;
 endmodule
 ";
 

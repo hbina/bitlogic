@@ -30,14 +30,30 @@ enum Item {
         attrs: Vec<Attribute>,
         name: Ident,
         ty: Type,
+        clock: Option<Ident>,
         registered: bool,
     },
     Output {
         attrs: Vec<Attribute>,
         name: Ident,
         ty: Type,
+        clock: Option<Ident>,
         source: Expr,
         registered: bool,
+    },
+    /// `clock name[, period = ns];`
+    Clock {
+        name: Ident,
+        period: Option<syn::Lit>,
+    },
+    /// `cross name: T = gray(source) into clock;` (or `level(...)`).
+    Cross {
+        attrs: Vec<Attribute>,
+        name: Ident,
+        ty: Type,
+        kind: Ident,
+        source: Expr,
+        into: Ident,
     },
     Memory {
         attrs: Vec<Attribute>,
@@ -52,33 +68,31 @@ enum Item {
         attrs: Vec<Attribute>,
         name: Ident,
         state: Type,
+        clock: Option<Ident>,
         function: syn::Path,
         input: ExprStruct,
     },
     Write {
         memory: Ident,
         args: Vec<Expr>,
+        clock: Option<Ident>,
     },
     Read {
         memory: Ident,
         args: Vec<Expr>,
+        clock: Option<Ident>,
     },
     Port {
         attrs: Vec<Attribute>,
         name: Ident,
         req: Type,
         rsp: Type,
+        clock: Option<Ident>,
     },
     /// `request port(valid, data)`.
-    Request {
-        port: Ident,
-        args: Vec<Expr>,
-    },
+    Request { port: Ident, args: Vec<Expr> },
     /// `respond port(ready)`.
-    Respond {
-        port: Ident,
-        args: Vec<Expr>,
-    },
+    Respond { port: Ident, args: Vec<Expr> },
 }
 
 fn keyword(input: ParseStream, word: &str) -> syn::Result<()> {
@@ -97,6 +111,15 @@ fn registered(input: ParseStream) -> syn::Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+/// `in clock` or nothing.
+fn domain(input: ParseStream) -> syn::Result<Option<Ident>> {
+    if input.peek(Token![in]) {
+        input.parse::<Token![in]>()?;
+        return Ok(Some(input.parse()?));
+    }
+    Ok(None)
 }
 
 fn arguments(input: ParseStream) -> syn::Result<Vec<Expr>> {
@@ -133,10 +156,12 @@ impl Parse for Item {
                 let name = input.parse()?;
                 input.parse::<Token![:]>()?;
                 let ty = input.parse()?;
+                let clock = domain(input)?;
                 Item::Input {
                     attrs,
                     name,
                     ty,
+                    clock,
                     registered: registered(input)?,
                 }
             }
@@ -144,14 +169,63 @@ impl Parse for Item {
                 let name = input.parse()?;
                 input.parse::<Token![:]>()?;
                 let ty = input.parse()?;
+                let clock = domain(input)?;
                 input.parse::<Token![=]>()?;
                 let source = input.parse()?;
                 Item::Output {
                     attrs,
                     name,
                     ty,
+                    clock,
                     source,
                     registered: registered(input)?,
+                }
+            }
+            "clock" => {
+                if let Some(attr) = attrs.first() {
+                    return Err(error(attr, "a clock takes no attributes"));
+                }
+                let name = input.parse()?;
+                let period = if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                    keyword(input, "period")?;
+                    input.parse::<Token![=]>()?;
+                    let lit: syn::Lit = input.parse().map_err(|e| {
+                        syn::Error::new(e.span(), "a period is a number of nanoseconds")
+                    })?;
+                    if !matches!(lit, syn::Lit::Float(_) | syn::Lit::Int(_)) {
+                        return Err(error(lit, "a period is a number of nanoseconds"));
+                    }
+                    Some(lit)
+                } else {
+                    None
+                };
+                Item::Clock { name, period }
+            }
+            "cross" => {
+                let name = input.parse()?;
+                input.parse::<Token![:]>()?;
+                let ty = input.parse()?;
+                input.parse::<Token![=]>()?;
+                let kind: Ident = input.parse()?;
+                if kind != "gray" && kind != "level" {
+                    return Err(error(kind, "a crossing is `gray(...)` or `level(...)`"));
+                }
+                let content;
+                parenthesized!(content in input);
+                let source = content.parse()?;
+                if !content.is_empty() {
+                    return Err(content.error("a crossing takes one source"));
+                }
+                keyword(input, "into")?;
+                let into = input.parse()?;
+                Item::Cross {
+                    attrs,
+                    name,
+                    ty,
+                    kind,
+                    source,
+                    into,
                 }
             }
             "ram" | "rom" => {
@@ -195,6 +269,7 @@ impl Parse for Item {
                 let name = input.parse()?;
                 input.parse::<Token![:]>()?;
                 let state = input.parse()?;
+                let clock = domain(input)?;
                 input.parse::<Token![=]>()?;
                 let function = input.parse()?;
                 let content;
@@ -207,6 +282,7 @@ impl Parse for Item {
                     attrs,
                     name,
                     state,
+                    clock,
                     function,
                     input: literal,
                 }
@@ -217,15 +293,24 @@ impl Parse for Item {
                 }
                 let target = input.parse()?;
                 let args = arguments(input)?;
+                let clock = domain(input)?;
                 match kind.to_string().as_str() {
                     "write" => Item::Write {
                         memory: target,
                         args,
+                        clock,
                     },
                     "read" => Item::Read {
                         memory: target,
                         args,
+                        clock,
                     },
+                    _ if clock.is_some() => {
+                        return Err(error(
+                            target,
+                            "a port's connections are in the port's clock domain",
+                        ));
+                    }
                     "request" => Item::Request { port: target, args },
                     _ => Item::Respond { port: target, args },
                 }
@@ -236,18 +321,20 @@ impl Parse for Item {
                 let req = input.parse()?;
                 input.parse::<Token![=>]>()?;
                 let rsp = input.parse()?;
+                let clock = domain(input)?;
                 Item::Port {
                     attrs,
                     name,
                     req,
                     rsp,
+                    clock,
                 }
             }
             _ => {
                 return Err(error(
                     kind,
-                    "expected `param`, `input`, `output`, `ram`, `rom`, `unit`, `port`, \
-                     `write`, `read`, `request` or `respond`",
+                    "expected `param`, `clock`, `input`, `output`, `ram`, `rom`, `unit`, \
+                     `port`, `cross`, `write`, `read`, `request` or `respond`",
                 ));
             }
         };
@@ -285,6 +372,7 @@ enum Kind {
     Memory,
     Unit,
     Port,
+    Cross,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -302,6 +390,7 @@ enum Source {
     Output(Ident, Vec<Ident>),
     Rdata(Ident),
     Port(Ident, PortSignal, Vec<Ident>),
+    Cross(Ident),
 }
 
 /// `a.b.c` as identifiers.
@@ -334,9 +423,40 @@ fn names(path: &[Ident]) -> Vec<String> {
 
 struct Context {
     kinds: BTreeMap<String, Kind>,
+    /// The clock domain of each clocked name (`""` in a system with one
+    /// clock): units, inputs, ports, crossings (their destination) and
+    /// memories (their read port, which `rdata` belongs to).
+    domains: BTreeMap<String, String>,
 }
 
 impl Context {
+    /// The clock domain of a source; `None` for a param (any domain).
+    fn domain_of(&self, source: &Source) -> Option<&str> {
+        let name = match source {
+            Source::Param(_) => return None,
+            Source::Input(p) => &p[0],
+            Source::State(u, _) | Source::Output(u, _) => u,
+            Source::Rdata(m) => m,
+            Source::Port(p, ..) => p,
+            Source::Cross(c) => c,
+        };
+        self.domains.get(&name.to_string()).map(String::as_str)
+    }
+
+    /// `expr` (already resolved to `source`) must be in `clock`.
+    fn in_domain(&self, expr: &Expr, source: &Source, clock: &str) -> syn::Result<()> {
+        match self.domain_of(source) {
+            Some(d) if d != clock => Err(error(
+                expr,
+                &format!(
+                    "this value is in clock domain `{d}`, not `{clock}`: bring it across \
+                     with a `cross`"
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn source(&self, expr: &Expr) -> syn::Result<Source> {
         let path = path_of(expr)?;
         let (head, rest) = path.split_first().expect("non-empty");
@@ -348,6 +468,12 @@ impl Context {
             Kind::Input { .. } => Source::Input(path.clone()),
             Kind::Output => {
                 return Err(error(head, "outputs cannot drive connections"));
+            }
+            Kind::Cross => {
+                if !rest.is_empty() {
+                    return Err(error(expr, "a crossing is read by its name"));
+                }
+                Source::Cross(head.clone())
             }
             Kind::Memory => {
                 if rest.len() != 1 || rest[0] != "rdata" {
@@ -414,6 +540,10 @@ impl Context {
                 };
                 quote!(#local #(.#path)*)
             }
+            Source::Cross(c) => {
+                let field = format_ident!("__cross_{}", c);
+                quote!(self.#field.value())
+            }
         }
     }
 
@@ -457,12 +587,49 @@ impl Context {
                     path: #rest,
                 })
             }
+            Source::Cross(c) => {
+                let name = c.to_string();
+                quote!(::bitlogic::system::Source::Cross { name: #name })
+            }
         }
     }
 }
 
+/// `Some("name")` as tokens, or `None` for the single clock.
+fn clock_tokens(clock: &str) -> Tokens {
+    if clock.is_empty() {
+        quote!(::std::option::Option::None)
+    } else {
+        quote!(::std::option::Option::Some(#clock))
+    }
+}
+
+/// `snake_case` as `CamelCase`, for the `Clock` enum's variants.
+fn camel(name: &str) -> String {
+    name.split('_')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut c = p.chars();
+            c.next()
+                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 const RESERVED: &[&str] = &[
-    "eval", "state", "inputs", "clk", "rst", "new", "clock", "reset", "edge", "outputs",
+    "eval",
+    "state",
+    "inputs",
+    "clk",
+    "rst",
+    "new",
+    "clock",
+    "reset",
+    "edge",
+    "outputs",
+    "tick",
+    "cdc_noise",
 ];
 
 pub fn expand(spec: Spec) -> syn::Result<Tokens> {
@@ -472,6 +639,55 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
         name,
         items,
     } = spec;
+    // Clock domains: none declared is the one implicit clock (`""`).
+    let mut clocks: Vec<(Ident, Option<syn::Lit>)> = Vec::new();
+    for item in &items {
+        if let Item::Clock { name, period } = item {
+            if RESERVED.contains(&name.to_string().as_str()) || name.to_string().starts_with("__") {
+                return Err(error(name, "this name is reserved in a system"));
+            }
+            if clocks.iter().any(|(c, _)| c == name) {
+                return Err(error(name, "duplicate clock"));
+            }
+            clocks.push((name.clone(), period.clone()));
+        }
+    }
+    let multi = !clocks.is_empty();
+    // An item's domain: required with clocks declared, refused without.
+    let clock_of = |clock: &Option<Ident>, at: &dyn quote::ToTokens| -> syn::Result<String> {
+        match (clock, multi) {
+            (Some(c), true) if clocks.iter().any(|(d, _)| d == c) => Ok(c.to_string()),
+            (Some(c), true) => Err(error(c, "not a declared `clock`")),
+            (None, true) => Err(error(at, "name this item's clock domain with `in <clock>`")),
+            (Some(c), false) => Err(error(
+                c,
+                "no `clock` is declared: a system with one clock \
+                 names no domains",
+            )),
+            (None, false) => Ok(String::new()),
+        }
+    };
+    let mut domains = BTreeMap::new();
+    for item in &items {
+        match item {
+            Item::Unit { name, clock, .. }
+            | Item::Input { name, clock, .. }
+            | Item::Port { name, clock, .. } => {
+                domains.insert(name.to_string(), clock_of(clock, name)?);
+            }
+            Item::Read { memory, clock, .. } => {
+                domains.insert(memory.to_string(), clock_of(clock, memory)?);
+            }
+            Item::Cross { name, into, .. } => {
+                if !multi {
+                    return Err(error(name, "a crossing needs `clock` domains"));
+                }
+                domains.insert(name.to_string(), clock_of(&Some(into.clone()), name)?);
+            }
+            _ => {}
+        }
+    }
+
     // Every top-level name and its kind.
     let mut kinds = BTreeMap::new();
     let mut memories = BTreeMap::new();
@@ -493,10 +709,12 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
             }
             Item::Unit { name, .. } => (name, Kind::Unit),
             Item::Port { name, .. } => (name, Kind::Port),
+            Item::Cross { name, .. } => (name, Kind::Cross),
             Item::Write { .. }
             | Item::Read { .. }
             | Item::Request { .. }
-            | Item::Respond { .. } => continue,
+            | Item::Respond { .. }
+            | Item::Clock { .. } => continue,
         };
         let key = id.to_string();
         if RESERVED.contains(&key.as_str()) || key.starts_with("__") {
@@ -506,7 +724,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
             return Err(error(id, "duplicate name in a system"));
         }
     }
-    let cx = Context { kinds };
+    let cx = Context { kinds, domains };
 
     let mut fields = Vec::new();
     let mut inits = Vec::new();
@@ -515,11 +733,14 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
     let mut input_zero = Vec::new();
     let mut output_fields = Vec::new();
     let mut output_values = Vec::new();
-    let mut evaluations = Vec::new();
-    let mut reads = Vec::new();
-    let mut writes = Vec::new();
-    let mut latches = Vec::new();
-    let mut commits = Vec::new();
+    // Per clock domain (`""` for the one clock): what its edge evaluates,
+    // reads, latches, writes and commits.
+    let mut evaluations: Vec<(String, Tokens)> = Vec::new();
+    let mut reads: Vec<(String, Tokens)> = Vec::new();
+    let mut writes: Vec<(String, Tokens)> = Vec::new();
+    let mut latches: Vec<(String, Tokens)> = Vec::new();
+    let mut commits: Vec<(String, Tokens)> = Vec::new();
+    let mut design_crossings = Vec::new();
     let mut design_params = Vec::new();
     let mut design_inputs = Vec::new();
     let mut design_outputs = Vec::new();
@@ -532,8 +753,8 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
     let mut links: BTreeMap<String, (Ident, Type, Type)> = BTreeMap::new();
     let mut requests: BTreeMap<String, (Source, Source)> = BTreeMap::new();
     let mut responds: BTreeMap<String, Source> = BTreeMap::new();
-    let mut port_prelude = Vec::new();
-    let mut port_cycles = Vec::new();
+    let mut port_prelude: Vec<(String, Tokens)> = Vec::new();
+    let mut port_cycles: Vec<(String, Tokens)> = Vec::new();
 
     for item in &items {
         match item {
@@ -562,7 +783,10 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 name,
                 ty,
                 registered,
+                ..
             } => {
+                let dom = cx.domains[&name.to_string()].clone();
+                let clock = clock_tokens(&dom);
                 input_fields.push(quote!(#(#attrs)* pub #name: #ty,));
                 input_zero.push(quote!(#name: ::bitlogic::LogicValue::zeroed(),));
                 if *registered {
@@ -571,11 +795,15 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                         pub #name: #ty,
                     ));
                     inits.push(quote!(#name: ::bitlogic::LogicValue::zeroed(),));
-                    commits.push(quote!(self.#name = __zero_or(rst, inputs.#name);));
+                    commits.push((
+                        dom.clone(),
+                        quote!(self.#name = __zero_or(rst, inputs.#name);),
+                    ));
                 }
                 let label = name.to_string();
                 design_inputs.push(quote!(::bitlogic::system::InputSpec {
                     name: #label,
+                    clock: #clock,
                     schema: <#ty as ::bitlogic::LogicValue>::schema(),
                     registered: #registered,
                 }));
@@ -584,10 +812,14 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 attrs,
                 name,
                 ty,
+                clock,
                 source,
                 registered,
             } => {
+                let dom = clock_of(clock, name)?;
                 let src = cx.source(source)?;
+                cx.in_domain(source, &src, &dom)?;
+                let clock = clock_tokens(&dom);
                 match (&src, registered) {
                     (Source::Output(..), false) => {
                         return Err(error(
@@ -621,8 +853,8 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     inits.push(quote!(#reg: ::bitlogic::LogicValue::zeroed(),));
                     let value = cx.native(&src);
                     let next = format_ident!("__next_{}", name);
-                    latches.push(quote!(let #next: #ty = #value;));
-                    commits.push(quote!(self.#reg = __zero_or(rst, #next);));
+                    latches.push((dom.clone(), quote!(let #next: #ty = #value;)));
+                    commits.push((dom.clone(), quote!(self.#reg = __zero_or(rst, #next);)));
                     output_values.push(quote!(#name: self.#reg,));
                 } else {
                     // Sampled after the edge from registered values.
@@ -633,6 +865,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 let design = cx.design(&src);
                 design_outputs.push(quote!(::bitlogic::system::OutputSpec {
                     name: #label,
+                    clock: #clock,
                     schema: <#ty as ::bitlogic::LogicValue>::schema(),
                     source: #design,
                     registered: #registered,
@@ -686,7 +919,10 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 state,
                 function,
                 input,
+                ..
             } => {
+                let dom = cx.domains[&name.to_string()].clone();
+                let clock = clock_tokens(&dom);
                 if input.rest.is_some() || input.dot2_token.is_some() {
                     return Err(error(
                         input,
@@ -713,6 +949,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                         continue;
                     }
                     let src = cx.source(&field.expr)?;
+                    cx.in_domain(&field.expr, &src, &dom)?;
                     if let Source::Output(..) = src {
                         return Err(error(
                             &field.expr,
@@ -731,13 +968,18 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 }
                 let local = format_ident!("__unit_{}", name);
                 let ty = &input.path;
-                evaluations.push(quote!(
-                    let #local = self.eval.eval::<#function>(#ty { #(#values)* });
+                evaluations.push((
+                    dom.clone(),
+                    quote!(let #local = self.eval.eval::<#function>(#ty { #(#values)* });),
                 ));
-                commits.push(quote!(self.#name = __zero_or(rst, #local.state);));
+                commits.push((
+                    dom.clone(),
+                    quote!(self.#name = __zero_or(rst, #local.state);),
+                ));
                 let label = name.to_string();
                 design_units.push(quote!(::bitlogic::system::UnitSpec {
                     name: #label,
+                    clock: #clock,
                     logic: <#function as ::bitlogic::LogicFn>::graph()?,
                     state: <#state as ::bitlogic::LogicValue>::schema(),
                     connections: ::std::vec![#(#connections),*],
@@ -748,6 +990,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 name,
                 req,
                 rsp,
+                ..
             } => {
                 fields.push(quote!(
                     #(#attrs)*
@@ -764,6 +1007,63 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 ));
                 output_values.push(quote!(#name: self.#last,));
                 links.insert(name.to_string(), (name.clone(), req.clone(), rsp.clone()));
+            }
+            Item::Clock { .. } => {}
+            Item::Cross {
+                attrs,
+                name,
+                ty,
+                kind,
+                source,
+                into,
+            } => {
+                let src = cx.source(source)?;
+                if !matches!(src, Source::State(..) | Source::Input(..)) {
+                    return Err(error(
+                        source,
+                        "a crossing carries a unit's state or an input",
+                    ));
+                }
+                let from = cx
+                    .domain_of(&src)
+                    .expect("a state or an input has a domain")
+                    .to_string();
+                let to = into.to_string();
+                if from == to {
+                    return Err(error(into, "this value is already in that clock domain"));
+                }
+                let field = format_ident!("__cross_{}", name);
+                let label = name.to_string();
+                let gray = kind == "gray";
+                let kind_tokens = if gray {
+                    quote!(::bitlogic::system::CrossKind::Gray)
+                } else {
+                    quote!(::bitlogic::system::CrossKind::Level)
+                };
+                fields.push(quote!(
+                    #(#attrs)*
+                    /// This crossing's registers.
+                    pub #field: ::bitlogic::system::Crossing<#ty>,
+                ));
+                inits
+                    .push(quote!(#field: ::bitlogic::system::Crossing::new(#label, #kind_tokens),));
+                let value = cx.native(&src);
+                let next = format_ident!("__xsrc_{}", name);
+                latches.push((from.clone(), quote!(let #next: #ty = #value;)));
+                commits.push((from.clone(), quote!(self.#field.source_edge(#next, rst);)));
+                commits.push((
+                    to.clone(),
+                    quote!(self.#field.dest_edge(rst, &mut self.cdc_noise);),
+                ));
+                let design = cx.design(&src);
+                design_crossings.push(quote!(::bitlogic::system::CrossSpec {
+                    name: #label,
+                    kind: #kind_tokens,
+                    schema: <#ty as ::bitlogic::LogicValue>::schema(),
+                    source: #design,
+                    from: #from,
+                    to: #to,
+                }));
             }
             Item::Request { port, args } | Item::Respond { port, args } => {
                 let request = matches!(item, Item::Request { .. });
@@ -783,10 +1083,12 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     .iter()
                     .map(|a| cx.source(a))
                     .collect::<syn::Result<Vec<_>>>()?;
+                let dom = cx.domains[&port.to_string()].clone();
                 for (src, arg) in srcs.iter().zip(args) {
                     if let Source::Port(..) = src {
                         return Err(error(arg, "a port signal cannot drive a port"));
                     }
+                    cx.in_domain(arg, src, &dom)?;
                 }
                 let key = port.to_string();
                 let mut srcs = srcs.into_iter();
@@ -801,8 +1103,19 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     return Err(error(port, "this port is already connected"));
                 }
             }
-            Item::Write { memory, args } | Item::Read { memory, args } => {
+            Item::Write {
+                memory,
+                args,
+                clock,
+            }
+            | Item::Read {
+                memory,
+                args,
+                clock,
+            } => {
                 let write = matches!(item, Item::Write { .. });
+                let dom = clock_of(clock, memory)?;
+                let clock = clock_tokens(&dom);
                 let Some(&rom) = memories.get(&memory.to_string()) else {
                     return Err(error(memory, "not a declared `ram` or `rom`"));
                 };
@@ -828,24 +1141,30 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     .iter()
                     .map(|a| cx.source(a))
                     .collect::<syn::Result<Vec<_>>>()?;
+                for (src, arg) in srcs.iter().zip(args) {
+                    cx.in_domain(arg, src, &dom)?;
+                }
                 let native: Vec<_> = srcs.iter().map(|s| cx.native(s)).collect();
                 let design: Vec<_> = srcs.iter().map(|s| cx.design(s)).collect();
                 let label = memory.to_string();
                 if write {
                     let (en, addr, data) = (&native[0], &native[1], &native[2]);
-                    writes.push(quote!(if #en { self.#memory.write(#addr, #data); }));
+                    writes.push((
+                        dom.clone(),
+                        quote!(if #en { self.#memory.write(#addr, #data); }),
+                    ));
                     let (en, addr, data) = (&design[0], &design[1], &design[2]);
                     design_writes.push(quote!(::bitlogic::system::WriteSpec {
-                        memory: #label, enable: #en, address: #addr, data: #data,
+                        memory: #label, clock: #clock, enable: #en, address: #addr, data: #data,
                     }));
                 } else {
                     let local = format_ident!("__rdata_{}", memory);
                     let addr = &native[0];
-                    reads.push(quote!(let #local = self.#memory.read(#addr);));
-                    commits.push(quote!(self.#memory.rdata = #local;));
+                    reads.push((dom.clone(), quote!(let #local = self.#memory.read(#addr);)));
+                    commits.push((dom.clone(), quote!(self.#memory.rdata = #local;)));
                     let addr = &design[0];
                     design_reads.push(quote!(::bitlogic::system::ReadSpec {
-                        memory: #label, address: #addr,
+                        memory: #label, clock: #clock, address: #addr,
                     }));
                 }
             }
@@ -860,16 +1179,21 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
         let offer = format_ident!("__port_{}_offer", port);
         let rsp_valid = format_ident!("__port_{}_rsp_valid", port);
         let rsp_local = format_ident!("__port_{}_rsp", port);
-        port_prelude.push(quote!(
-            let #ready_local: bool = self.#port.req_ready();
-            let #offer: ::std::option::Option<#rsp> = self.#port.rsp();
-            let #rsp_valid: bool = #offer.is_some();
-            let #rsp_local: #rsp = #offer.unwrap_or_else(::bitlogic::LogicValue::zeroed);
+        let dom = cx.domains[key].clone();
+        let clock = clock_tokens(&dom);
+        port_prelude.push((
+            dom.clone(),
+            quote!(
+                let #ready_local: bool = self.#port.req_ready();
+                let #offer: ::std::option::Option<#rsp> = self.#port.rsp();
+                let #rsp_valid: bool = #offer.is_some();
+                let #rsp_local: #rsp = #offer.unwrap_or_else(::bitlogic::LogicValue::zeroed);
+            ),
         ));
         let cycle = format_ident!("__cycle_{}", port);
         let last = format_ident!("__port_{}", port);
         let (v, d, r) = (cx.native(valid), cx.native(data), cx.native(ready));
-        port_cycles.push(quote!(
+        port_cycles.push((dom.clone(), quote!(
             let #cycle: ::bitlogic::system::PortCycle<#req, #rsp> = ::bitlogic::system::PortCycle {
                 req_valid: #v,
                 req: #d,
@@ -878,15 +1202,19 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 rsp: #rsp_local,
                 rsp_ready: #r,
             };
-        ));
-        commits.push(quote!(
-            self.#port.edge(#cycle.request(), #cycle.response().is_some());
-            self.#last = #cycle;
+        )));
+        commits.push((
+            dom.clone(),
+            quote!(
+                self.#port.edge(#cycle.request(), #cycle.response().is_some());
+                self.#last = #cycle;
+            ),
         ));
         let label = port.to_string();
         let (v, d, r) = (cx.design(valid), cx.design(data), cx.design(ready));
         design_ports.push(quote!(::bitlogic::system::PortSpec {
             name: #label,
+            clock: #clock,
             request: <#req as ::bitlogic::LogicValue>::schema(),
             response: <#rsp as ::bitlogic::LogicValue>::schema(),
             req_valid: #v,
@@ -914,31 +1242,173 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
     }
 
     let label = name.to_string();
-    let doc = format!(
-        "Cycle model of the `{label}` system. `clock` advances one edge and \
-         `reset` one edge with the synchronous reset asserted; all state and \
-         boundary registers start at zero (the reset state)."
-    );
-    Ok(quote! {
-        #(#attrs)*
-        #vis mod #name {
-            #![allow(unused_imports, dead_code, clippy::all)]
-            use super::*;
+    let doc = if multi {
+        format!(
+            "Cycle model of the `{label}` system, one clock domain at a time: \
+             `tick` advances one domain's edge and `reset` one with that domain's \
+             synchronous reset asserted (each domain has its own); every state, \
+             boundary and crossing register starts at zero (the reset state). \
+             Drive the domains' edges in time order, for example from a \
+             `bitlogic::system::Schedule`."
+        )
+    } else {
+        format!(
+            "Cycle model of the `{label}` system. `clock` advances one edge and \
+             `reset` one edge with the synchronous reset asserted; all state and \
+             boundary registers start at zero (the reset state)."
+        )
+    };
+    // One edge function per domain.
+    let keys: Vec<String> = if multi {
+        clocks.iter().map(|(c, _)| c.to_string()).collect()
+    } else {
+        vec![String::new()]
+    };
+    let pick = |v: &[(String, Tokens)], k: &str| -> Vec<Tokens> {
+        v.iter()
+            .filter(|(d, _)| d == k)
+            .map(|(_, t)| t.clone())
+            .collect()
+    };
+    let mut edge_fns = Vec::new();
+    for k in &keys {
+        let f = if multi {
+            format_ident!("__edge_{}", k)
+        } else {
+            format_ident!("edge")
+        };
+        let (pp, ev, rd, la, pc, wr, cm) = (
+            pick(&port_prelude, k),
+            pick(&evaluations, k),
+            pick(&reads, k),
+            pick(&latches, k),
+            pick(&port_cycles, k),
+            pick(&writes, k),
+            pick(&commits, k),
+        );
+        edge_fns.push(quote!(
+            fn #f(&mut self, inputs: Inputs, rst: bool) -> Outputs {
+                fn __zero_or<T: ::bitlogic::LogicValue>(rst: bool, next: T) -> T {
+                    if rst { T::zeroed() } else { next }
+                }
+                // What each port's other side offers this cycle.
+                #(#pp)*
+                // Units see only registered values and port signals, so
+                // order is free.
+                #(#ev)*
+                // Read-first memories: sample before this edge's writes.
+                #(#rd)*
+                #(#la)*
+                #(#pc)*
+                #(#wr)*
+                #(#cm)*
+                self.outputs()
+            }
+        ));
+    }
+    let variants: Vec<Ident> = clocks
+        .iter()
+        .map(|(c, _)| format_ident!("{}", camel(&c.to_string())))
+        .collect();
+    let clock_names: Vec<String> = clocks.iter().map(|(c, _)| c.to_string()).collect();
+    let periods: Vec<Tokens> = clocks
+        .iter()
+        .map(|(_, p)| match p {
+            Some(lit) => quote!(::std::option::Option::Some(#lit as f64)),
+            None => quote!(::std::option::Option::None),
+        })
+        .collect();
+    let edge_names: Vec<Ident> = keys.iter().map(|k| format_ident!("__edge_{}", k)).collect();
+    let design_clocks: Vec<Tokens> = clock_names
+        .iter()
+        .zip(&periods)
+        .map(|(n, p)| quote!(::bitlogic::system::ClockSpec { name: #n, period_ns: #p }))
+        .collect();
+    let count = clocks.len();
+    let (noise_field, noise_init) = if multi {
+        (
+            quote!(
+                /// Synchronizer noise for the crossings (off by default).
+                pub cdc_noise: ::bitlogic::system::CdcNoise,
+            ),
+            quote!(cdc_noise: ::std::default::Default::default(),),
+        )
+    } else {
+        (quote!(), quote!())
+    };
+    let api = if multi {
+        quote!(
+            /// The system's clock domains.
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+            pub enum Clock { #(#variants),* }
 
-            /// Values on the system's input pins for one cycle.
-            #[derive(Clone, Copy, Debug, PartialEq)]
-            pub struct Inputs { #(#input_fields)* }
-
-            /// Output pins just after an edge.
-            #[derive(Clone, Copy, Debug, PartialEq)]
-            pub struct Outputs { #(#output_fields)* }
-
-            #[doc = #doc]
-            pub struct Core<E: ::bitlogic::Evaluate = ::bitlogic::Native> {
-                pub eval: E,
-                #(#fields)*
+            impl Clock {
+                pub const ALL: [Clock; #count] = [#(Clock::#variants),*];
+                pub fn name(self) -> &'static str {
+                    match self { #(Clock::#variants => #clock_names),* }
+                }
+                /// The declared nominal period in nanoseconds.
+                pub fn period_ns(self) -> ::std::option::Option<f64> {
+                    match self { #(Clock::#variants => #periods),* }
+                }
+                /// Every clock at its declared period (and `ppm` parts per
+                /// million off, per clock), first edges at time 0, in
+                /// `Clock::ALL` order. Panics if a clock has no period.
+                pub fn schedule(ppm: [f64; #count]) -> ::bitlogic::system::Schedule {
+                    let clocks: ::std::vec::Vec<(u64, u64)> = Clock::ALL
+                        .iter()
+                        .zip(ppm)
+                        .map(|(c, ppm)| {
+                            let ns = c.period_ns().expect("every clock declares a period");
+                            (::bitlogic::system::Schedule::period_fs(ns, ppm), 0)
+                        })
+                        .collect();
+                    ::bitlogic::system::Schedule::new(&clocks)
+                }
             }
 
+            impl<E: ::bitlogic::Evaluate> Core<E> {
+                /// The system after two reset edges of every domain with every
+                /// input zero, so each memory's read data matches its
+                /// reset-state address.
+                pub fn new(eval: E, #(#new_params),*) -> Self {
+                    let mut core = Self { eval, #noise_init #(#inits)* };
+                    let zero = Inputs { #(#input_zero)* };
+                    for _ in 0..2 {
+                        for c in Clock::ALL {
+                            core.reset(c, zero);
+                        }
+                    }
+                    core
+                }
+
+                /// One edge of `clock` with `inputs` on the pins (a domain
+                /// uses only its own inputs); returns the outputs just after it.
+                pub fn tick(&mut self, clock: Clock, inputs: impl ::std::convert::Into<Inputs>) -> Outputs {
+                    self.edge(clock, inputs.into(), false)
+                }
+
+                /// One edge of `clock` with that domain's synchronous reset
+                /// asserted: its state, boundary and crossing registers become
+                /// zero. Memories keep their contents.
+                pub fn reset(&mut self, clock: Clock, inputs: impl ::std::convert::Into<Inputs>) -> Outputs {
+                    self.edge(clock, inputs.into(), true)
+                }
+
+                fn edge(&mut self, clock: Clock, inputs: Inputs, rst: bool) -> Outputs {
+                    match clock { #(Clock::#variants => self.#edge_names(inputs, rst)),* }
+                }
+
+                #(#edge_fns)*
+
+                /// The output pins as they stand.
+                pub fn outputs(&self) -> Outputs {
+                    Outputs { #(#output_values)* }
+                }
+            }
+        )
+    } else {
+        quote!(
             impl<E: ::bitlogic::Evaluate> Core<E> {
                 /// The system after two reset edges with every input zero,
                 /// so each memory's read data matches its reset-state address.
@@ -963,29 +1433,37 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     self.edge(inputs.into(), true)
                 }
 
-                fn edge(&mut self, inputs: Inputs, rst: bool) -> Outputs {
-                    fn __zero_or<T: ::bitlogic::LogicValue>(rst: bool, next: T) -> T {
-                        if rst { T::zeroed() } else { next }
-                    }
-                    // What each port's other side offers this cycle.
-                    #(#port_prelude)*
-                    // Units see only registered values and port signals, so
-                    // order is free.
-                    #(#evaluations)*
-                    // Read-first memories: sample before this edge's writes.
-                    #(#reads)*
-                    #(#latches)*
-                    #(#port_cycles)*
-                    #(#writes)*
-                    #(#commits)*
-                    self.outputs()
-                }
+                #(#edge_fns)*
 
                 /// The output pins as they stand.
                 pub fn outputs(&self) -> Outputs {
                     Outputs { #(#output_values)* }
                 }
             }
+        )
+    };
+    Ok(quote! {
+        #(#attrs)*
+        #vis mod #name {
+            #![allow(unused_imports, dead_code, clippy::all)]
+            use super::*;
+
+            /// Values on the system's input pins for one cycle.
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            pub struct Inputs { #(#input_fields)* }
+
+            /// Output pins just after an edge.
+            #[derive(Clone, Copy, Debug, PartialEq)]
+            pub struct Outputs { #(#output_fields)* }
+
+            #[doc = #doc]
+            pub struct Core<E: ::bitlogic::Evaluate = ::bitlogic::Native> {
+                pub eval: E,
+                #noise_field
+                #(#fields)*
+            }
+
+            #api
 
             /// This system as data for the Verilog backend.
             pub fn design() -> ::std::result::Result<::bitlogic::system::Design, ::bitlogic::Error> {
@@ -999,6 +1477,8 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     writes: ::std::vec![#(#design_writes),*],
                     reads: ::std::vec![#(#design_reads),*],
                     ports: ::std::vec![#(#design_ports),*],
+                    clocks: ::std::vec![#(#design_clocks),*],
+                    crossings: ::std::vec![#(#design_crossings),*],
                 })
             }
 
@@ -1096,6 +1576,124 @@ mod tests {
             ("output o: bool = sync, latched;", "expected `registered`"),
         ] {
             let err = check(items).unwrap_err().to_string();
+            assert!(err.contains(message), "{items}: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_and_checks_clock_domains() {
+        let two = |items: &str| -> syn::Result<Tokens> {
+            expand(syn::parse_str(&format!(
+                "mod s {{ clock a, period = 10.0; clock b, period = 40; param cfg: Cfg; \
+                 input go: bool in a, registered; ram buf: Bits<8>, addr_bits = 4; {items} }}"
+            ))?)
+        };
+        let good = "unit u: S in a = f(I { state, go, cfg, r: rb }); \
+                    unit v: S in b = f(I { state, w: wa, d: buf.rdata }); \
+                    cross wa: Bits<4> = gray(u.state.w) into b; \
+                    cross rb: Bits<4> = gray(v.state.r) into a; \
+                    write buf(u.we, u.addr, u.data) in a; read buf(v.addr) in b; \
+                    output o: bool in a = u.we, registered; output p: bool in b = v.state.y;";
+        two(good).unwrap();
+        let ports = "write buf(u.we, u.addr, u.data) in a; read buf(u.addr) in a;";
+        for (items, message) in [
+            (
+                format!("unit u: S = f(I {{ state }}); {ports}"),
+                "with `in <clock>`",
+            ),
+            (
+                format!("unit u: S in c = f(I {{ state }}); {ports}"),
+                "not a declared `clock`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); unit v: S in b = f(I {{ state, x: u.state.x }}); {ports}"
+                ),
+                "in clock domain `a`, not `b`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); unit v: S in b = f(I {{ state, x: go }}); {ports}"
+                ),
+                "bring it across with a `cross`",
+            ),
+            (
+                "unit u: S in a = f(I { state }); unit v: S in b = f(I { state }); \
+                 write buf(u.we, u.addr, u.data) in a; read buf(u.addr) in b;"
+                    .to_string(),
+                "in clock domain `a`, not `b`",
+            ),
+            (
+                "unit u: S in a = f(I { state, d: buf.rdata }); unit v: S in b = f(I { state }); \
+                 write buf(u.we, u.addr, u.data) in a; read buf(v.addr) in b;"
+                    .to_string(),
+                "in clock domain `b`, not `a`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} output o: bool in b = u.state.x;"
+                ),
+                "in clock domain `a`, not `b`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} cross x: Bits<4> = gray(u.state.w) into a;"
+                ),
+                "already in that clock domain",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} cross x: Bits<8> = gray(buf.rdata) into b;"
+                ),
+                "a unit's state or an input",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} cross x: Bits<4> = fast(u.state.w) into b;"
+                ),
+                "`gray(...)` or `level(...)`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} cross x: Bits<4> = gray(u.state.w) into c;"
+                ),
+                "not a declared `clock`",
+            ),
+            (
+                format!(
+                    "unit u: S in a = f(I {{ state }}); {ports} cross x: Bits<4> = gray(u.state.w) onto b;"
+                ),
+                "expected `into`",
+            ),
+            (
+                format!("clock a; unit u: S in a = f(I {{ state }}); {ports}"),
+                "duplicate clock",
+            ),
+            (
+                "unit u: S in a = f(I { state }); write buf(u.we, u.addr, u.data); read buf(u.addr) in a;"
+                    .to_string(),
+                "with `in <clock>`",
+            ),
+        ] {
+            let err = two(&items).unwrap_err().to_string();
+            assert!(err.contains(message), "{items}: {err}");
+        }
+        // Without `clock` items, naming a domain or crossing is refused.
+        for (items, message) in [
+            (
+                "unit u: S in a = f(I { state, a: go });",
+                "no `clock` is declared",
+            ),
+            (
+                "unit u: S = f(I { state, a: go }); cross x: Bits<4> = gray(u.state.w) into a;",
+                "needs `clock` domains",
+            ),
+            ("clock a, period = fast;", "nanoseconds"),
+        ] {
+            let full = format!(
+                "{items} write buf(u.we, u.addr, u.data); read buf(u.addr); read table(u.addr);"
+            );
+            let err = check(&full).unwrap_err().to_string();
             assert!(err.contains(message), "{items}: {err}");
         }
     }

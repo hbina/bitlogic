@@ -13,8 +13,10 @@ keep `Cargo.lock` checked in. Run `cargo fmt --all`,
 
 Keep native Rust evaluation, the typed IR, and emitted HDL semantics in sync.
 Compiler tests must check independent expected behavior and generated HDL where
-appropriate. Timing, clocks, resets, CDC, pads, and electrical integration belong
-to the user's top module. Do not claim physical timing, FPGA fit, or ASIC signoff
+appropriate. Clock domains and their crossings declared in a `system!` are
+bitlogic's (cycle model, Verilog synchronizers, generated constraints); clock
+generation, reset sequencing, pads, and electrical integration belong to the
+user's top module. Do not claim physical timing, FPGA fit, or ASIC signoff
 from functional simulation.
 
 ## Optional Python tooling
