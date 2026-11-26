@@ -130,7 +130,7 @@ bitlogic::system! {
         param cfg: Cfg = Cfg { step: bits(3), enable: true };
         input ctl: Ctl, registered;
         input poke: Bits<8>;
-        ram ring: Bits<8>, addr_bits = 4;
+        ram ring: Bits<8>, addr_bits = 4, style = distributed;
         rom scale: Bits<6>, addr_bits = 3, contents = SCALES.map(bits::<6>);
         unit prod: ProdState = produce(ProdIn { state, cfg, ctl, rd: cons.state.rd });
         unit cons: ConsState = consume(ConsIn {
@@ -325,7 +325,10 @@ fn generated_verilog_matches_cycle_model() {
     );
     let core_v = &files[0].1;
     assert!(core_v.contains("parameter [7:0] CFG_STEP = 8'h3"));
-    assert!(core_v.contains("bitlogic_sdp_ram #(.ADDR_W(4), .DATA_W(8)) ring_i"));
+    assert!(
+        core_v
+            .contains("bitlogic_sdp_ram #(.ADDR_W(4), .DATA_W(8), .STYLE(\"distributed\")) ring_i")
+    );
 
     let mut tb = String::from(
         "`timescale 1ns / 1ps\nmodule tb;\n    reg clk = 0, rst = 1;\n    always #5 clk = ~clk;\n    \

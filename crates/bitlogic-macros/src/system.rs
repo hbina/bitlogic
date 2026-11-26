@@ -45,6 +45,8 @@ enum Item {
         ty: Type,
         addr_bits: LitInt,
         contents: Option<Expr>,
+        /// `, style = distributed` or `block` on a RAM.
+        style: Option<Ident>,
     },
     Unit {
         attrs: Vec<Attribute>,
@@ -168,12 +170,25 @@ impl Parse for Item {
                 } else {
                     None
                 };
+                let style = if kind == "ram" && input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                    keyword(input, "style")?;
+                    input.parse::<Token![=]>()?;
+                    let style: Ident = input.parse()?;
+                    if style != "distributed" && style != "block" {
+                        return Err(error(style, "style must be `distributed` or `block`"));
+                    }
+                    Some(style)
+                } else {
+                    None
+                };
                 Item::Memory {
                     attrs,
                     name,
                     ty,
                     addr_bits,
                     contents,
+                    style,
                 }
             }
             "unit" => {
@@ -629,6 +644,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 ty,
                 addr_bits,
                 contents,
+                style,
             } => {
                 let bits: u32 = addr_bits.base10_parse()?;
                 if !(1..=24).contains(&bits) {
@@ -651,11 +667,17 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     )),
                     None => quote!(::std::option::Option::None),
                 };
+                let style_tokens = match style.as_ref().map(|s| s.to_string()).as_deref() {
+                    Some("distributed") => quote!(::bitlogic::system::RamStyle::Distributed),
+                    Some(_) => quote!(::bitlogic::system::RamStyle::Block),
+                    None => quote!(::bitlogic::system::RamStyle::Auto),
+                };
                 design_memories.push(quote!(::bitlogic::system::MemorySpec {
                     name: #label,
                     element: <#ty as ::bitlogic::LogicValue>::schema(),
                     addr_bits: #bits,
                     contents: #contents,
+                    style: #style_tokens,
                 }));
             }
             Item::Unit {
@@ -1062,6 +1084,14 @@ mod tests {
             ("unit go: S = f(I { state });", "duplicate name"),
             ("unit eval: S = f(I { state });", "reserved"),
             ("ram big: Bits<8>, addr_bits = 25;", "1..=24"),
+            (
+                "ram r: Bits<8>, addr_bits = 4, style = fast;",
+                "`distributed` or `block`",
+            ),
+            (
+                "ram r: Bits<8>, addr_bits = 4, kind = block;",
+                "expected `style`",
+            ),
             ("wire w: bool;", "expected `param`"),
             ("output o: bool = sync, latched;", "expected `registered`"),
         ] {
