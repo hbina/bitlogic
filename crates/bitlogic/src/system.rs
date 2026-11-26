@@ -1830,7 +1830,9 @@ module bitlogic_cdc_gray #(
     input  wire         dest_rst,
     output wire [W-1:0] dest_out
 );
-    reg [W-1:0] src_q = {W{1'b0}};
+    // Its own register per crossing (never merged with an equivalent one,
+    // which the constraints would not name).
+    (* DONT_TOUCH = \"TRUE\" *) reg [W-1:0] src_q = {W{1'b0}};
     (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s1_reg = {W{1'b0}};
     (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s2_reg = {W{1'b0}};
     always @(posedge src_clk)
@@ -1862,7 +1864,9 @@ module bitlogic_cdc_level #(
     input  wire         dest_rst,
     output wire [W-1:0] dest_out
 );
-    reg [W-1:0] src_q = {W{1'b0}};
+    // Its own register per crossing (never merged with an equivalent one,
+    // which the constraints would not name).
+    (* DONT_TOUCH = \"TRUE\" *) reg [W-1:0] src_q = {W{1'b0}};
     (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s1_reg = {W{1'b0}};
     (* ASYNC_REG = \"TRUE\" *) reg [W-1:0] s2_reg = {W{1'b0}};
     always @(posedge src_clk)
