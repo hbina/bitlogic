@@ -441,7 +441,7 @@ fn generated_files_ports_and_constraints() {
         "bitlogic_cdc {*wr_b_cross_i/src_q_reg*} {*wr_b_cross_i/s1_reg*} 1",
         "bitlogic_cdc {*rd_a_cross_i/src_q_reg*} {*rd_a_cross_i/s1_reg*} 1",
         "bitlogic_cdc {*flag_b_cross_i/src_q_reg*} {*flag_b_cross_i/s1_reg*} 0",
-        "bitlogic_cdc {*ring_i/*mem_reg*} {*ring_i/*rdata_reg*} 0",
+        "bitlogic_cdc_ram {*ring_i/*rdata_reg*}",
         "set_max_delay -datapath_only",
         "set_bus_skew",
     ] {

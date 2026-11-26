@@ -1087,6 +1087,20 @@ impl Design {
              set period [lindex $periods 0]\n    \
              set_max_delay -datapath_only -from $from -to $to $period\n    \
              if {{$skew}} {{ set_bus_skew -from $from -to $to $period }}\n\
+             }}\n\
+             # A dual-clock RAM: its read registers and, from whatever cells drive\n\
+             # them, the memory cells (the tool may pack several RAMs' bits into\n\
+             # one primitive, so the cells are found from the registers, not by name).\n\
+             proc bitlogic_cdc_ram {{to_pattern}} {{\n    \
+             set to [get_cells -quiet -hierarchical -filter \"NAME =~ $to_pattern && IS_PRIMITIVE\"]\n    \
+             if {{[llength $to] == 0}} {{ return }}\n    \
+             set d [get_pins -quiet -of_objects $to -filter {{REF_PIN_NAME == D}}]\n    \
+             set from [filter [all_fanin -quiet -flat -startpoints_only -only_cells $d] {{PRIMITIVE_GROUP == DMEM}}]\n    \
+             if {{[llength $from] == 0}} {{ return }}\n    \
+             set pins [get_pins -quiet -of_objects [concat $from $to] -filter {{IS_CLOCK}}]\n    \
+             set periods [lsort -real [get_property PERIOD [get_clocks -quiet -of_objects $pins]]]\n    \
+             if {{[llength $periods] == 0}} {{ return }}\n    \
+             set_max_delay -datapath_only -from $from -to $to [lindex $periods 0]\n\
              }}\n",
             self.name
         );
@@ -1100,12 +1114,7 @@ impl Design {
             .unwrap();
         }
         for m in self.memories.iter().filter(|m| self.two_clocks(m)) {
-            writeln!(
-                text,
-                "bitlogic_cdc {{*{n}_i/*mem_reg*}} {{*{n}_i/*rdata_reg*}} 0",
-                n = m.name
-            )
-            .unwrap();
+            writeln!(text, "bitlogic_cdc_ram {{*{n}_i/*rdata_reg*}}", n = m.name).unwrap();
         }
         Ok(text)
     }
