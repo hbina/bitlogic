@@ -43,6 +43,7 @@ enum Item {
     },
     /// `clock name[, period = ns];`
     Clock {
+        attrs: Vec<Attribute>,
         name: Ident,
         period: Option<syn::Lit>,
     },
@@ -182,9 +183,6 @@ impl Parse for Item {
                 }
             }
             "clock" => {
-                if let Some(attr) = attrs.first() {
-                    return Err(error(attr, "a clock takes no attributes"));
-                }
                 let name = input.parse()?;
                 let period = if input.peek(Token![,]) {
                     input.parse::<Token![,]>()?;
@@ -200,7 +198,11 @@ impl Parse for Item {
                 } else {
                     None
                 };
-                Item::Clock { name, period }
+                Item::Clock {
+                    attrs,
+                    name,
+                    period,
+                }
             }
             "cross" => {
                 let name = input.parse()?;
@@ -641,8 +643,14 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
     } = spec;
     // Clock domains: none declared is the one implicit clock (`""`).
     let mut clocks: Vec<(Ident, Option<syn::Lit>)> = Vec::new();
+    let mut clock_attrs: Vec<Vec<Attribute>> = Vec::new();
     for item in &items {
-        if let Item::Clock { name, period } = item {
+        if let Item::Clock {
+            attrs,
+            name,
+            period,
+        } = item
+        {
             if RESERVED.contains(&name.to_string().as_str()) || name.to_string().starts_with("__") {
                 return Err(error(name, "this name is reserved in a system"));
             }
@@ -650,6 +658,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 return Err(error(name, "duplicate clock"));
             }
             clocks.push((name.clone(), period.clone()));
+            clock_attrs.push(attrs.clone());
         }
     }
     let multi = !clocks.is_empty();
@@ -1340,7 +1349,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
         quote!(
             /// The system's clock domains.
             #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-            pub enum Clock { #(#variants),* }
+            pub enum Clock { #(#(#clock_attrs)* #variants),* }
 
             impl Clock {
                 pub const ALL: [Clock; #count] = [#(Clock::#variants),*];
