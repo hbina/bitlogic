@@ -61,6 +61,14 @@ pub enum Operation {
         amount: u32,
         left: bool,
     },
+    /// `a × b`, cut to the node's width. The operands may have any widths:
+    /// each is extended to the node's width first, with copies of its top
+    /// bit when `signed` (two's complement), else with zeros.
+    Mul {
+        a: NodeId,
+        b: NodeId,
+        signed: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +323,11 @@ impl Logic {
                         amount,
                         left,
                     },
+                    Operation::Mul { a, b, signed } => Operation::Mul {
+                        a: map(a),
+                        b: map(b),
+                        signed,
+                    },
                     Operation::Input(_) => unreachable!(),
                 };
                 let id = NodeId(result.nodes.len());
@@ -405,6 +418,15 @@ impl Logic {
                     amount,
                     left,
                 } => format!("n{} {} {amount}", value.0, if left { "<<" } else { ">>" }),
+                // The assignment's width (the node's, at least the operands')
+                // sizes the product; `$signed` operands are sign-extended to it.
+                Operation::Mul { a, b, signed } => {
+                    if signed {
+                        format!("$signed(n{}) * $signed(n{})", a.0, b.0)
+                    } else {
+                        format!("n{} * n{}", a.0, b.0)
+                    }
+                }
             };
             writeln!(
                 text,
@@ -467,6 +489,15 @@ fn compute_small(
             value(a).checked_shr(amount)
         }
         .unwrap_or(0),
+        Operation::Mul { a, b, signed } => {
+            if signed {
+                let x = bitvec::sign_extend(value(a), u32::from(width(a)));
+                let y = bitvec::sign_extend(value(b), u32::from(width(b)));
+                x.wrapping_mul(y) as u64
+            } else {
+                value(a).wrapping_mul(value(b))
+            }
+        }
     }
 }
 
@@ -530,6 +561,13 @@ fn compute<'a>(
                 bitvec::shr(out, value(a), amount, w);
             }
         }
+        Operation::Mul { a, b, signed } => bitvec::mul(
+            out,
+            (value(a), usize::from(width(a))),
+            (value(b), usize::from(width(b))),
+            w,
+            signed,
+        ),
     }
 }
 
@@ -541,7 +579,9 @@ fn operands(operation: &Operation) -> Vec<NodeId> {
         | Operation::Shift { value: a, .. } => {
             vec![a]
         }
-        Operation::Binary(_, a, b) | Operation::Concat(a, b) => vec![a, b],
+        Operation::Binary(_, a, b) | Operation::Concat(a, b) | Operation::Mul { a, b, .. } => {
+            vec![a, b]
+        }
         Operation::Mux { condition, yes, no } => vec![condition, yes, no],
     }
 }
@@ -790,6 +830,20 @@ impl Builder {
                 left,
             },
         )
+    }
+    /// `a × b` (operands of any widths), `width` bits wide: the product of
+    /// the operands extended to `width` bits (sign-extended when `signed`),
+    /// modulo `2^width`. A zero operand folds to zero.
+    pub fn mul(&mut self, a: NodeId, b: NodeId, width: u16, signed: bool) -> Result<NodeId, Error> {
+        self.width(a)?;
+        self.width(b)?;
+        if [a, b]
+            .iter()
+            .any(|&id| self.constant_value(id).is_some_and(BitVec::is_zero))
+        {
+            return self.constant(width, 0);
+        }
+        self.push(width, Operation::Mul { a, b, signed })
     }
     pub fn output(&mut self, name: &str, value: NodeId) -> Result<(), Error> {
         if !identifier(name) || self.outputs.iter().any(|p| p.name == name) {

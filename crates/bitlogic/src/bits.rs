@@ -3,7 +3,7 @@
 use crate::bitvec::{self, MAX_WIDTH, words_for};
 use std::cmp::Ordering;
 use std::fmt;
-use std::ops::{Add, BitAnd, BitOr, BitXor, Not, Shl, Shr, Sub};
+use std::ops::{Add, BitAnd, BitOr, BitXor, Mul, Not, Shl, Shr, Sub};
 
 /// The width `N` of a `Bits<N>`, as a type. [`Storage`] is implemented for
 /// every `Width<N>` with `N` in `1..=MAX_WIDTH`.
@@ -122,6 +122,86 @@ where
         bitvec::concat(result.0.as_mut(), self.words(), rhs.words(), M, O);
         result
     }
+    /// The full unsigned product, `O = N + M` bits wide (it never wraps).
+    pub fn mul_wide<const M: usize, const O: usize>(self, rhs: Bits<M>) -> Bits<O>
+    where
+        Width<M>: Storage,
+        Width<O>: Storage,
+    {
+        assert!(N.checked_add(M) == Some(O), "product width mismatch");
+        if O <= 64 {
+            return bits(self.low() * rhs.low());
+        }
+        let mut result = Bits::<O>(<Width<O> as Storage>::ZERO);
+        bitvec::mul(
+            result.0.as_mut(),
+            (self.words(), N),
+            (rhs.words(), M),
+            O,
+            false,
+        );
+        result
+    }
+    /// The full product of both values read as two's complement, `O = N + M`
+    /// bits wide (it never wraps), as two's complement.
+    pub fn smul_wide<const M: usize, const O: usize>(self, rhs: Bits<M>) -> Bits<O>
+    where
+        Width<M>: Storage,
+        Width<O>: Storage,
+    {
+        assert!(N.checked_add(M) == Some(O), "product width mismatch");
+        if O <= 64 {
+            let a = bitvec::sign_extend(self.low(), N as u32);
+            let b = bitvec::sign_extend(rhs.low(), M as u32);
+            return bits(a.wrapping_mul(b) as u64);
+        }
+        let mut result = Bits::<O>(<Width<O> as Storage>::ZERO);
+        bitvec::mul(
+            result.0.as_mut(),
+            (self.words(), N),
+            (rhs.words(), M),
+            O,
+            true,
+        );
+        result
+    }
+    /// The top bit: set for a negative value read as two's complement.
+    fn negative(self) -> bool {
+        self.bit(N - 1)
+    }
+    /// Both values read as two's complement, ordered.
+    fn signed_cmp(self, rhs: Self) -> Ordering {
+        match (self.negative(), rhs.negative()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            _ => self.cmp(&rhs),
+        }
+    }
+    /// Signed `<`: both values read as two's complement.
+    pub fn slt(self, rhs: Self) -> bool {
+        self.signed_cmp(rhs).is_lt()
+    }
+    /// Signed `<=`.
+    pub fn sle(self, rhs: Self) -> bool {
+        self.signed_cmp(rhs).is_le()
+    }
+    /// Signed `>`.
+    pub fn sgt(self, rhs: Self) -> bool {
+        self.signed_cmp(rhs).is_gt()
+    }
+    /// Signed `>=`.
+    pub fn sge(self, rhs: Self) -> bool {
+        self.signed_cmp(rhs).is_ge()
+    }
+    /// Arithmetic shift right: `>>` filling with copies of the top bit, so
+    /// a two's complement value is divided by `2^amount`, rounding down.
+    pub fn sar(self, amount: u32) -> Self {
+        if self.negative() {
+            !(!self >> amount)
+        } else {
+            self >> amount
+        }
+    }
     /// The low word. With `N <= 64` it is the whole value: the `if N <= 64`
     /// fast paths below are resolved at compile time.
     #[inline(always)]
@@ -201,6 +281,20 @@ binary!(Add, add, u64::wrapping_add, |o, a, b| {
 binary!(Sub, sub, u64::wrapping_sub, |o, a, b| {
     bitvec::add(o, a, b, N, true)
 });
+/// The product, wrapping at N bits (the same bits signed or unsigned).
+impl<const N: usize> Mul for Bits<N>
+where
+    Width<N>: Storage,
+{
+    type Output = Self;
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        if N <= 64 {
+            return bits(self.low().wrapping_mul(rhs.low()));
+        }
+        self.map(|o, a| bitvec::mul(o, (a, N), (rhs.words(), N), N, false))
+    }
+}
 impl<const N: usize> Not for Bits<N>
 where
     Width<N>: Storage,

@@ -78,6 +78,57 @@ pub(crate) fn add(out: &mut [u64], a: &[u64], b: &[u64], width: usize, subtract:
     mask_top(out, width);
 }
 
+/// The `words` words of `a`, an `a_width`-bit value, extended: with copies
+/// of its top bit when `signed`, else with zeros.
+fn extend(a: &[u64], a_width: usize, words: usize, signed: bool) -> Vec<u64> {
+    let mut out: Vec<u64> = (0..words).map(|i| word(a, i)).collect();
+    if signed && a_width > 0 && word(a, (a_width - 1) / 64) >> ((a_width - 1) % 64) & 1 != 0 {
+        for (i, w) in out.iter_mut().enumerate() {
+            let low = i * 64;
+            if low >= a_width {
+                *w = u64::MAX;
+            } else if a_width - low < 64 {
+                *w |= u64::MAX << (a_width - low);
+            }
+        }
+    }
+    out
+}
+
+/// `a × b`, cut to `width` bits. `a` and `b` are `a_width` and `b_width`
+/// bits wide, extended to `width` first: sign-extended when `signed`, so the
+/// result is the two's complement product modulo `2^width`.
+pub(crate) fn mul(
+    out: &mut [u64],
+    (a, a_width): (&[u64], usize),
+    (b, b_width): (&[u64], usize),
+    width: usize,
+    signed: bool,
+) {
+    let n = out.len();
+    let a = extend(a, a_width, n, signed);
+    let b = extend(b, b_width, n, signed);
+    out.fill(0);
+    for (i, &x) in a.iter().enumerate() {
+        if x == 0 {
+            continue;
+        }
+        let mut carry = 0u128;
+        for (j, &y) in b[..n - i].iter().enumerate() {
+            let t = u128::from(out[i + j]) + u128::from(x) * u128::from(y) + carry;
+            out[i + j] = t as u64;
+            carry = t >> 64;
+        }
+    }
+    mask_top(out, width);
+}
+
+/// A `width`-bit value (1..=64) as a signed number.
+pub(crate) fn sign_extend(value: u64, width: u32) -> i64 {
+    let shift = 64 - width;
+    ((value << shift) as i64) >> shift
+}
+
 pub(crate) fn compare(a: &[u64], b: &[u64]) -> Ordering {
     let n = a.len().max(b.len());
     (0..n)
@@ -357,6 +408,44 @@ mod tests {
             assert_eq!(get(&out), (a >> amount) & m, "{width} {a:x}>>{amount}");
         }
         assert_eq!(hex(&words(a)), format!("{a:x}"));
+        mul(
+            &mut out,
+            (&words(a), width),
+            (&words(b), width),
+            width,
+            false,
+        );
+        assert_eq!(get(&out), a.wrapping_mul(b) & m, "{width} {a:x}*{b:x}");
+        mul(
+            &mut out,
+            (&words(a), width),
+            (&words(b), width),
+            width,
+            true,
+        );
+        assert_eq!(get(&out), a.wrapping_mul(b) & m, "{width} {a:x}*s{b:x}");
+        // Full products of two narrower operands, as 128-bit values.
+        for (wa, wb) in [(1, 1), (7, 9), (25, 18), (48, 32), (63, 65), (64, 64)] {
+            let (ma, mb) = ((1u128 << wa) - 1, (1u128 << wb) - 1);
+            let (x, y) = (a & ma, b & mb);
+            let total = wa + wb;
+            let mt = if total == 128 {
+                u128::MAX
+            } else {
+                (1u128 << total) - 1
+            };
+            let mut out = vec![0; words_for(total)];
+            mul(&mut out, (&words(x), wa), (&words(y), wb), total, false);
+            assert_eq!(get(&out), x * y, "{wa}x{wb} {x:x}*{y:x}");
+            let sx = ((x << (128 - wa)) as i128) >> (128 - wa);
+            let sy = ((y << (128 - wb)) as i128) >> (128 - wb);
+            mul(&mut out, (&words(x), wa), (&words(y), wb), total, true);
+            assert_eq!(
+                get(&out),
+                (sx.wrapping_mul(sy) as u128) & mt,
+                "{wa}x{wb} signed {x:x}*{y:x}"
+            );
+        }
     }
 
     #[test]

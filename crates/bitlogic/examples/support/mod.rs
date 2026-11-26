@@ -101,6 +101,10 @@ fn circuit_mermaid(module: &str, logic: &Logic) -> String {
                 format!("shift {} {amount}", if left { "left" } else { "right" }),
                 vec![(value, "value")],
             ),
+            Operation::Mul { a, b, signed } => (
+                if signed { "MUL signed" } else { "MUL" }.into(),
+                vec![(a, "lhs"), (b, "rhs")],
+            ),
         };
         writeln!(
             graph,

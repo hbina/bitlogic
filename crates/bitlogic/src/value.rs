@@ -1354,6 +1354,96 @@ impl Symbolic {
             values: vec![builder.concat(self.scalar()?, rhs.scalar()?)?],
         })
     }
+    /// The width of a `Bits<N>` value, or `what`'s error.
+    fn bits_width(&self, what: &str) -> Result<u16, Error> {
+        match self.schema {
+            Schema::Bits(width) => Ok(width),
+            _ => Err(Error(format!("{what} requires Bits<N>"))),
+        }
+    }
+    /// `a * b`: both `Bits<N>`, the product wrapping at N bits.
+    pub fn mul(&self, builder: &mut Builder, rhs: &Self) -> Result<Self, Error> {
+        let width = self.bits_width("*")?;
+        if rhs.schema != self.schema {
+            return Err(Error("binary logical type mismatch".into()));
+        }
+        Ok(Self {
+            schema: self.schema.clone(),
+            values: vec![builder.mul(self.scalar()?, rhs.scalar()?, width, false)?],
+        })
+    }
+    /// `a.mul_wide::<M, O>(b)` (or `smul_wide`, `signed`): the full product,
+    /// `O = N + M` bits wide.
+    pub fn mul_wide(
+        &self,
+        builder: &mut Builder,
+        rhs: &Self,
+        low: u16,
+        total: u16,
+        signed: bool,
+    ) -> Result<Self, Error> {
+        let high = self.bits_width("mul_wide")?;
+        if rhs.schema != Schema::Bits(low) || u32::from(high) + u32::from(low) != u32::from(total) {
+            return Err(Error("product width mismatch".into()));
+        }
+        Ok(Self {
+            schema: Schema::Bits(total),
+            values: vec![builder.mul(self.scalar()?, rhs.scalar()?, total, signed)?],
+        })
+    }
+    /// A signed comparison (`op` one of `Lt`, `Le`, `Gt`, `Ge`) of two
+    /// `Bits<N>` read as two's complement: with the top bits equal it is the
+    /// unsigned comparison; otherwise the negative value is the smaller.
+    pub fn signed_compare(
+        &self,
+        builder: &mut Builder,
+        op: Binary,
+        rhs: &Self,
+    ) -> Result<Self, Error> {
+        let width = self.bits_width("signed comparison")?;
+        if rhs.schema != self.schema {
+            return Err(Error("binary logical type mismatch".into()));
+        }
+        let (a, b) = (self.scalar()?, rhs.scalar()?);
+        let sa = builder.slice(a, width - 1, 1)?;
+        let sb = builder.slice(b, width - 1, 1)?;
+        let differ = builder.binary(Binary::Xor, sa, sb)?;
+        let unsigned = builder.binary(op, a, b)?;
+        // Signs differ: a < b exactly when a is the negative one.
+        let less = match op {
+            Binary::Lt | Binary::Le => sa,
+            Binary::Gt | Binary::Ge => sb,
+            _ => return Err(Error("signed comparisons are <, <=, > and >=".into())),
+        };
+        Ok(Self {
+            schema: Schema::Bool,
+            values: vec![builder.mux(differ, less, unsigned)?],
+        })
+    }
+    /// `a.sar(amount)`: `>>` filling with copies of the top bit.
+    pub fn sar(&self, builder: &mut Builder, amount: u32) -> Result<Self, Error> {
+        let width = self.bits_width("sar")?;
+        let a = self.scalar()?;
+        let sign = builder.slice(a, width - 1, 1)?;
+        let fill = |builder: &mut Builder, n: u16| -> Result<NodeId, Error> {
+            let ones = builder.constant(n, BitVec::ones(n))?;
+            let zeros = builder.constant(n, 0)?;
+            builder.mux(sign, ones, zeros)
+        };
+        let value = match u16::try_from(amount) {
+            Ok(0) => a,
+            Ok(k) if k < width => {
+                let high = fill(builder, k)?;
+                let low = builder.slice(a, k, width - k)?;
+                builder.concat(high, low)?
+            }
+            _ => fill(builder, width)?,
+        };
+        Ok(Self {
+            schema: self.schema.clone(),
+            values: vec![value],
+        })
+    }
     pub fn output(&self, builder: &mut Builder) -> Result<(), Error> {
         for ((path, _), &value) in self.schema.leaves().iter().zip(&self.values) {
             builder.output(&Schema::port_name("result", path), value)?;

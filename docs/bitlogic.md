@@ -73,6 +73,36 @@ complete next-state struct. The surrounding HDL module owns registers, reset,
 clock domains, synchronization, validity and pads. Calling the function twice
 composes transformations; it does not introduce two hardware cycles.
 
+### Multiplication and signed values
+
+`Bits<N>` is unsigned, but a value can be read as two's complement by the
+operations that need a sign:
+
+| Expression | Result | Meaning |
+|---|---|---|
+| `a * b` | `Bits<N>` | the product, wrapping at N bits (the same bits signed or unsigned) |
+| `a.mul_wide::<M, O>(b)` | `Bits<O>`, `O = N + M` | the full unsigned product of `a: Bits<N>` and `b: Bits<M>` |
+| `a.smul_wide::<M, O>(b)` | `Bits<O>`, `O = N + M` | the full product of both read as two's complement |
+| `a.slt(b)`, `sle`, `sgt`, `sge` | `bool` | `<`, `<=`, `>`, `>=` of both read as two's complement |
+| `a.sar(k)` | `Bits<N>` | `>>` by a literal `k`, filling with copies of the top bit (divides by 2^k, rounding down) |
+
+The full products never wrap, so a fixed-point multiply is a product and a
+slice: a 25-bit price difference times an 18-bit weight in Q2.16 is
+`d.smul_wide::<18, 43>(w).slice::<27>(16)`.
+
+The IR has one multiply node, `Operation::Mul { a, b, signed }`: operands of any
+widths, each extended to the node's width (sign-extended when `signed`), and
+the product modulo 2^width. The Verilog is `n_a * n_b` or
+`$signed(n_a) * $signed(n_b)`, sized by the assignment. A zero constant operand
+folds the product to zero. Signed comparisons and `sar` are built from the
+existing nodes (a sign-bit mux, and a concatenation of fill bits with a slice).
+
+On a 7-series FPGA a 25×18 signed product is one DSP48E1. Registers on its
+operands and product are absorbed into the DSP's own registers when nothing
+else uses them; wider products chain several DSPs (48×32 takes six). A
+`#[logic]` function stays combinational, so the registers come from the
+surrounding module or `system!`, as for any other logic.
+
 ## Arrays
 
 `[T; N]` is a value of N elements, flattened element by element (ports are
@@ -261,7 +291,9 @@ is 1 to 256.
 - Arrays, literal and run-time indexing, `set`, array literals and repeats as
   described under [Arrays](#arrays).
 - Paths to enum variants and `const` items, as constants.
-- Bitwise `&`, `|`, `^`, `!`; `+`, `-`; `==`, `!=`, `<`, `<=`, `>`, `>=`.
+- Bitwise `&`, `|`, `^`, `!`; `+`, `-`, `*`; `==`, `!=`, `<`, `<=`, `>`, `>=`.
+- `mul_wide`, `smul_wide`, `slt`, `sle`, `sgt`, `sge` and `sar` as described
+  under [Multiplication and signed values](#multiplication-and-signed-values).
 - Boolean `&&`, `||`; expressions in this subset have no side effects.
 - Literal `<<`/`>>` counts, boolean literals, `bits::<N>(integer literal)`.
 - `value.bit(index)`, `value.slice::<N>(offset)`, and

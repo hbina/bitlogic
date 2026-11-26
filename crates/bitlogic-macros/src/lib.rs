@@ -667,6 +667,9 @@ impl Lower {
                     return Ok(self.emit(quote!(#a.shift(__logic_builder,#amount,#left)?)));
                 }
                 let rhs = self.expr(&b.right, env)?;
+                if matches!(b.op, syn::BinOp::Mul(_)) {
+                    return Ok(self.emit(quote!(#a.mul(__logic_builder,&#rhs)?)));
+                }
                 let op = match b.op {
                     syn::BinOp::BitAnd(_) | syn::BinOp::And(_) => "And",
                     syn::BinOp::BitOr(_) | syn::BinOp::Or(_) => "Or",
@@ -831,9 +834,42 @@ impl Lower {
                             .map_err(|_| error(call, "concatenation width mismatch"))?;
                         Ok(self.emit(quote!(#a.concat(__logic_builder,&#b,#low,#total)?)))
                     }
+                    "mul_wide" | "smul_wide" if call.args.len() == 1 && generic.len() == 2 => {
+                        let b = self.expr(&call.args[0], env)?;
+                        let signed = call.method == "smul_wide";
+                        let low = u16::try_from(generic[0])
+                            .map_err(|_| error(call, "product width mismatch"))?;
+                        let total = u16::try_from(generic[1])
+                            .map_err(|_| error(call, "product width mismatch"))?;
+                        Ok(
+                            self.emit(
+                                quote!(#a.mul_wide(__logic_builder,&#b,#low,#total,#signed)?),
+                            ),
+                        )
+                    }
+                    "slt" | "sle" | "sgt" | "sge" if call.args.len() == 1 && generic.is_empty() => {
+                        let b = self.expr(&call.args[0], env)?;
+                        let op = format_ident!(
+                            "{}",
+                            match call.method.to_string().as_str() {
+                                "slt" => "Lt",
+                                "sle" => "Le",
+                                "sgt" => "Gt",
+                                _ => "Ge",
+                            }
+                        );
+                        Ok(self.emit(quote!(
+                            #a.signed_compare(__logic_builder,::bitlogic::Binary::#op,&#b)?
+                        )))
+                    }
+                    "sar" if call.args.len() == 1 && generic.is_empty() => {
+                        let amount = u32::try_from(integer(&call.args[0])?)
+                            .map_err(|_| error(call, "shift literal exceeds u32"))?;
+                        Ok(self.emit(quote!(#a.sar(__logic_builder,#amount)?)))
+                    }
                     _ => Err(error(
                         call,
-                        "supported methods: bit, slice, concat, at, set, bounded fold",
+                        "supported methods: bit, slice, concat, mul_wide, smul_wide, slt, sle, sgt, sge, sar, at, set, bounded fold",
                     )),
                 }
             }
