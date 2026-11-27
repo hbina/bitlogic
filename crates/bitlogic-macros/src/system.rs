@@ -72,6 +72,8 @@ enum Item {
         clock: Option<Ident>,
         function: syn::Path,
         input: ExprStruct,
+        /// `, pipeline`: rewrite rules add registers to the step function.
+        pipeline: bool,
     },
     Write {
         memory: Ident,
@@ -280,6 +282,13 @@ impl Parse for Item {
                 if !content.is_empty() {
                     return Err(content.error("a unit takes one struct literal"));
                 }
+                let pipeline = if input.peek(Token![,]) {
+                    input.parse::<Token![,]>()?;
+                    keyword(input, "pipeline")?;
+                    true
+                } else {
+                    false
+                };
                 Item::Unit {
                     attrs,
                     name,
@@ -287,6 +296,7 @@ impl Parse for Item {
                     clock,
                     function,
                     input: literal,
+                    pipeline,
                 }
             }
             "write" | "read" | "request" | "respond" => {
@@ -928,6 +938,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 state,
                 function,
                 input,
+                pipeline,
                 ..
             } => {
                 let dom = cx.domains[&name.to_string()].clone();
@@ -942,6 +953,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 inits.push(quote!(#name: ::bitlogic::LogicValue::zeroed(),));
                 let mut values = Vec::new();
                 let mut connections = Vec::new();
+                let mut stable = Vec::new();
                 let mut has_state = false;
                 for field in &input.fields {
                     let Member::Named(member) = &field.member else {
@@ -969,6 +981,9 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     let value = cx.native(&src);
                     values.push(quote!(#member: #value,));
                     let label = member.to_string();
+                    if let Source::Param(_) = src {
+                        stable.push(label.clone());
+                    }
                     let design = cx.design(&src);
                     connections.push(quote!((#label, #design)));
                 }
@@ -977,14 +992,44 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                 }
                 let local = format_ident!("__unit_{}", name);
                 let ty = &input.path;
-                evaluations.push((
-                    dom.clone(),
-                    quote!(let #local = self.eval.eval::<#function>(#ty { #(#values)* });),
-                ));
-                commits.push((
-                    dom.clone(),
-                    quote!(self.#name = __zero_or(rst, #local.state);),
-                ));
+                if *pipeline {
+                    let stall = format_ident!("__stall_{}", name);
+                    let hold = format_ident!("__hold_{}", name);
+                    let input = format_ident!("__in_{}", name);
+                    fields.push(quote!(
+                        /// When the pipelined unit holds its state.
+                        pub #stall: ::bitlogic::system::Stall,
+                    ));
+                    inits.push(quote!(
+                        #stall: ::bitlogic::system::Stall::new::<#function>(&[#(#stable),*]),
+                    ));
+                    evaluations.push((
+                        dom.clone(),
+                        quote!(
+                            let #input = #ty { #(#values)* };
+                            let #hold = !rst && self.#stall.holds(&self.#name, &#input);
+                            let #local = self.eval.eval::<#function>(#input);
+                        ),
+                    ));
+                    commits.push((
+                        dom.clone(),
+                        quote!(
+                            if !#hold {
+                                self.#name = __zero_or(rst, #local.state);
+                            }
+                            self.#stall.edge(rst, #hold);
+                        ),
+                    ));
+                } else {
+                    evaluations.push((
+                        dom.clone(),
+                        quote!(let #local = self.eval.eval::<#function>(#ty { #(#values)* });),
+                    ));
+                    commits.push((
+                        dom.clone(),
+                        quote!(self.#name = __zero_or(rst, #local.state);),
+                    ));
+                }
                 let label = name.to_string();
                 design_units.push(quote!(::bitlogic::system::UnitSpec {
                     name: #label,
@@ -992,6 +1037,7 @@ pub fn expand(spec: Spec) -> syn::Result<Tokens> {
                     logic: <#function as ::bitlogic::LogicFn>::graph()?,
                     state: <#state as ::bitlogic::LogicValue>::schema(),
                     connections: ::std::vec![#(#connections),*],
+                    pipeline: #pipeline,
                 }));
             }
             Item::Port {

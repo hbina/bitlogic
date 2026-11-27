@@ -295,6 +295,7 @@
 //! ```
 
 mod ir;
+pub mod pipeline;
 pub mod system;
 mod value;
 pub use bitlogic_macros::{LogicValue, fixed_map, fixed_set, logic, system};

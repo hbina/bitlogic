@@ -101,7 +101,8 @@ On a 7-series FPGA a 25×18 signed product is one DSP48E1. Registers on its
 operands and product are absorbed into the DSP's own registers when nothing
 else uses them; wider products chain several DSPs (48×32 takes six). A
 `#[logic]` function stays combinational, so the registers come from the
-surrounding module or `system!`, as for any other logic.
+surrounding module or `system!`, as for any other logic, or from a
+[pipelined unit](#pipelined-units).
 
 ## Arrays
 
@@ -431,6 +432,47 @@ in upper case (`CFG_STEP`), and inputs and outputs become ports named by their
 leaf path (`ctl_go`, `sum`). The connection struct literal is pasted into the
 cycle model, so rustc checks connection types; `verilog()` checks widths and
 schemas again and rejects unconnected fields.
+
+### Pipelined units
+
+`unit u: S = step(In { ... }), pipeline;` keeps `step` an ordinary Rust
+function and lets rewrite rules add registers to it in hardware. The rules are
+structural, with no timing model. The one rule so far puts a register on each
+operand of every multiply (constants excepted) and one on its product: on a
+7-series FPGA those are a DSP48E1's input and output registers.
+
+A unit is a loop, since its next state is computed from its state, so a
+register inside the step function is only correct if the unit waits for it.
+With `L` layers of registers on the deepest path to the next state, the unit
+holds its state for `L` cycles before taking a next state that passes through
+them. It holds only when it has to: following each path from a register to
+the next state, through the muxes on the way, gives the **stall condition**,
+the case in which some such path is selected. A unit that uses a product in
+one phase holds only in that phase:
+
+```text
+mac: 2 multiplies, 6 registers, latency 2; holds up to 2 cycles while (state.phase == 1)
+```
+
+That is `design()?.pipeline_reports()`, one line per pipelined unit. In the
+hardware, a counter holds the state register while the condition is set, for
+at most `L` cycles; the pipeline registers have no reset or enable. The cycle
+model holds the same way (`Core::__stall_<unit>`), so `Native`,
+`Interpreted` and the Verilog stay cycle for cycle equal. The analysis runs
+once per step function.
+
+Holding is correct only if nothing a register depends on changes meanwhile,
+so `verilog()` refuses a unit where:
+
+- a register depends on an input other than `state` and params (another
+  unit's state, read data or a system input can change while the unit
+  holds);
+- an output other than `state` depends on a register (it would be read before
+  the register filled).
+
+While the unit holds, its other outputs keep the held state's values, so a
+write enable that is set in a held cycle writes again each cycle. A unit
+without multiplies is unchanged: same Verilog, never holds.
 
 ### Ports
 

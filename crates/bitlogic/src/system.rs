@@ -73,6 +73,121 @@ impl Evaluate for Interpreted {
     }
 }
 
+/// The cycle model's side of a `unit ..., pipeline`: when the unit holds
+/// (see [`crate::pipeline`]). The analysis is done once per step function.
+pub struct Stall {
+    latency: u32,
+    condition: Option<std::sync::Arc<StallCondition>>,
+    waited: u32,
+    /// The step function's input leaves, reused each cycle.
+    leaves: RefCell<Vec<BitVec>>,
+    /// The last state the condition was evaluated on, and its value: kept
+    /// when the condition reads only the state.
+    last: RefCell<Option<(Box<dyn std::any::Any>, bool)>>,
+}
+
+/// A unit's stall condition: the pure graph, the step function's input
+/// leaves it reads, and whether those are all in `state`.
+#[derive(Debug)]
+struct StallCondition {
+    logic: Logic,
+    inputs: Vec<usize>,
+    state_only: bool,
+}
+
+impl std::fmt::Debug for Stall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stall")
+            .field("latency", &self.latency)
+            .field("waited", &self.waited)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Stall {
+    /// The stall of a unit stepped by `F`, whose fields `stable` are driven
+    /// by params. Panics if the rules cannot pipeline it (the design reports
+    /// the same error).
+    pub fn new<F: LogicFn>(stable: &[&str]) -> Self {
+        type Cache = HashMap<TypeId, (u32, Option<std::sync::Arc<StallCondition>>)>;
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+        let cache = CACHE.get_or_init(Default::default);
+        let found = cache.lock().unwrap().get(&TypeId::of::<F>()).cloned();
+        let (latency, condition) = found.unwrap_or_else(|| {
+            let logic = F::graph().expect("logic graph builds");
+            let p = crate::pipeline::pipeline(&logic, crate::pipeline::DEFAULT_RULES, stable)
+                .expect("the pipeline rules apply");
+            let (inputs, state_only) = (p.stall_inputs, p.stall_reads_state_only);
+            let entry = (
+                p.latency,
+                p.stall.map(|logic| {
+                    std::sync::Arc::new(StallCondition {
+                        logic,
+                        inputs,
+                        state_only,
+                    })
+                }),
+            );
+            cache
+                .lock()
+                .unwrap()
+                .insert(TypeId::of::<F>(), entry.clone());
+            entry
+        });
+        Stall {
+            latency,
+            condition,
+            waited: 0,
+            leaves: RefCell::new(Vec::new()),
+            last: RefCell::new(None),
+        }
+    }
+
+    /// Cycles the unit holds for, at most.
+    pub fn latency(&self) -> u32 {
+        self.latency
+    }
+
+    /// Whether the unit holds its state on this edge, given its current
+    /// `state` and this cycle's input to its step function.
+    pub fn holds<S, I>(&self, state: &S, input: &I) -> bool
+    where
+        S: LogicValue + PartialEq + Clone,
+        I: LogicValue,
+    {
+        let Some(c) = &self.condition else {
+            return false;
+        };
+        if self.waited >= self.latency {
+            return false;
+        }
+        if c.state_only
+            && let Some((last, value)) = &*self.last.borrow()
+            && last.downcast_ref::<S>() == Some(state)
+        {
+            return *value;
+        }
+        let mut leaves = self.leaves.borrow_mut();
+        leaves.clear();
+        input.flatten_into(&mut leaves);
+        let picked: Vec<&BitVec> = c.inputs.iter().map(|&k| &leaves[k]).collect();
+        let value = !c
+            .logic
+            .evaluate(&picked)
+            .expect("stall condition evaluates")[0]
+            .is_zero();
+        if c.state_only {
+            *self.last.borrow_mut() = Some((Box::new(state.clone()), value));
+        }
+        value
+    }
+
+    /// Count the edge: `held` from [`Stall::holds`].
+    pub fn edge(&mut self, rst: bool, held: bool) {
+        self.waited = if rst || !held { 0 } else { self.waited + 1 };
+    }
+}
+
 /// A RAM or ROM in a cycle model: `2^addr_bits` cells and the registered read
 /// output. Reads have one cycle of latency and return the old contents when
 /// the same address is written on the same edge.
@@ -621,6 +736,34 @@ pub struct UnitSpec {
     pub state: Schema,
     /// Input struct fields other than `state`, and what drives them.
     pub connections: Vec<(&'static str, Source)>,
+    /// `unit ..., pipeline`: the step function gets
+    /// [`crate::pipeline::DEFAULT_RULES`], and the unit holds while its
+    /// registers fill.
+    pub pipeline: bool,
+}
+
+impl UnitSpec {
+    /// The input fields that cannot change while the unit holds: those
+    /// driven by params.
+    fn stable_fields(&self) -> Vec<&'static str> {
+        self.connections
+            .iter()
+            .filter(|(_, s)| matches!(s, Source::Param { .. }))
+            .map(|(f, _)| *f)
+            .collect()
+    }
+
+    /// The step function after the pipeline rules (unchanged, latency 0,
+    /// for a unit without `pipeline`).
+    pub fn pipelined(&self) -> Result<crate::pipeline::Pipelined, Error> {
+        let rules: &[crate::pipeline::Rule] = if self.pipeline {
+            crate::pipeline::DEFAULT_RULES
+        } else {
+            &[]
+        };
+        crate::pipeline::pipeline(&self.logic, rules, &self.stable_fields())
+            .map_err(|e| Error(format!("unit `{}`: {}", self.name, e.0)))
+    }
 }
 
 pub struct WriteSpec {
@@ -1023,6 +1166,16 @@ impl Design {
         Ok((state, output))
     }
 
+    /// What the pipeline rules did to each `pipeline` unit, as `(unit,
+    /// report)`.
+    pub fn pipeline_reports(&self) -> Result<Vec<(&'static str, String)>, Error> {
+        self.units
+            .iter()
+            .filter(|u| u.pipeline)
+            .map(|u| Ok((u.name, u.pipelined()?.report)))
+            .collect()
+    }
+
     /// Every generated file as `(file name, contents)`: the core module, one
     /// wrapper per unit, one module per ROM and the shared RAM.
     pub fn verilog(&self) -> Result<Vec<(String, String)>, Error> {
@@ -1030,7 +1183,17 @@ impl Design {
         let mut files = vec![(format!("{}.v", self.name), self.core()?)];
         for u in &self.units {
             let module = format!("{}_unit", u.name);
-            files.push((format!("{module}.v"), u.logic.to_unit_verilog(&module)?));
+            let text = if u.pipeline {
+                let p = u.pipelined()?;
+                if p.latency > 0 {
+                    p.logic.to_pipelined_unit_verilog(&module, p.latency)?
+                } else {
+                    u.logic.to_unit_verilog(&module)?
+                }
+            } else {
+                u.logic.to_unit_verilog(&module)?
+            };
+            files.push((format!("{module}.v"), text));
         }
         for m in &self.memories {
             if let Some(contents) = &m.contents {
@@ -1899,6 +2062,23 @@ impl Logic {
     /// synchronous reset to zero, exposed as `s_<leaf>` outputs. The other
     /// input fields are `i_<leaf>` ports and the other outputs `o_<leaf>`.
     pub fn to_unit_verilog(&self, module: &str) -> Result<String, Error> {
+        self.unit_verilog(module, 0)
+    }
+
+    /// [`Logic::to_unit_verilog`] for a step function from
+    /// [`crate::pipeline::pipeline`] with `latency > 0`: its last output, the
+    /// stall condition, holds the state for up to `latency` cycles.
+    pub fn to_pipelined_unit_verilog(&self, module: &str, latency: u32) -> Result<String, Error> {
+        if latency == 0
+            || self.outputs().last().map(|p| p.name.as_str()) != Some(crate::pipeline::STALL_PORT)
+            || self.inputs().last().map(|p| p.name.as_str()) != Some(crate::pipeline::HOLD_PORT)
+        {
+            return fail(format!("{module}: not a pipelined step function"));
+        }
+        self.unit_verilog(module, latency)
+    }
+
+    fn unit_verilog(&self, module: &str, latency: u32) -> Result<String, Error> {
         let inner = format!("{module}_logic");
         let mut text =
             String::from("// Generated by bitlogic; do not edit.\n`timescale 1ns / 1ps\n");
@@ -1910,8 +2090,10 @@ impl Logic {
                 .cloned()
                 .partition(|p| state_output(&p.name).is_some())
         };
-        let (state_in, other_in) = split(self.inputs());
-        let (state_out, other_out) = split(self.outputs());
+        let inputs = &self.inputs()[..self.inputs().len() - usize::from(latency > 0)];
+        let (state_in, other_in) = split(inputs);
+        let outputs = &self.outputs()[..self.outputs().len() - usize::from(latency > 0)];
+        let (state_out, other_out) = split(outputs);
         let shape = |ports: &[crate::Port]| -> Vec<(String, u16)> {
             ports.iter().map(|p| (p.name.clone(), p.width)).collect()
         };
@@ -1941,6 +2123,25 @@ impl Logic {
         writeln!(text, "    wire [{}:0] next_state;", width - 1).unwrap();
 
         let mut connections = Vec::new();
+        if self.is_clocked() {
+            connections.push(".clk(clk)".to_string());
+        }
+        let wait_bits = 32 - latency.leading_zeros();
+        if latency > 0 {
+            writeln!(
+                text,
+                "    // Pipelined: hold the state while the stall condition is set,\n    \
+                 // for up to {latency} cycles, so its registers fill (the step\n    \
+                 // function's next state is the current one while `stall`).\n    \
+                 wire stall_when;\n    reg [{w}:0] waited = {wait_bits}'d0;\n    \
+                 wire stall = stall_when && waited != {wait_bits}'d{latency};",
+                w = wait_bits - 1
+            )
+            .unwrap();
+            connections.push(format!(".o_{}(stall_when)", crate::pipeline::STALL_PORT));
+            // The step function keeps the state itself while `stall`.
+            connections.push(format!(".i_{}(stall)", crate::pipeline::HOLD_PORT));
+        }
         let mut offset = 0;
         for p in &state_in {
             let s = state_output(&p.name).expect("a state port");
@@ -1962,12 +2163,24 @@ impl Logic {
             connections.join(",\n        ")
         )
         .unwrap();
-        writeln!(
-            text,
-            "    always @(posedge clk) begin\n        if (rst) state <= {width}'d0;\n        \
-             else state <= next_state;\n    end\nendmodule"
-        )
-        .unwrap();
+        if latency > 0 {
+            writeln!(
+                text,
+                "    always @(posedge clk) begin\n        if (rst) begin\n            \
+                 state <= {width}'d0;\n            waited <= {wait_bits}'d0;\n        \
+                 end else begin\n            state <= next_state;\n            \
+                 waited <= stall ? waited + {wait_bits}'d1 : {wait_bits}'d0;\n        \
+                 end\n    end\nendmodule"
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                text,
+                "    always @(posedge clk) begin\n        if (rst) state <= {width}'d0;\n        \
+                 else state <= next_state;\n    end\nendmodule"
+            )
+            .unwrap();
+        }
         Ok(text)
     }
 }

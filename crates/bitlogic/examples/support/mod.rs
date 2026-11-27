@@ -105,6 +105,7 @@ fn circuit_mermaid(module: &str, logic: &Logic) -> String {
                 if signed { "MUL signed" } else { "MUL" }.into(),
                 vec![(a, "lhs"), (b, "rhs")],
             ),
+            Operation::Reg(a) => ("REG".into(), vec![(a, "value")]),
         };
         writeln!(
             graph,

@@ -17,7 +17,7 @@ pub(crate) fn fail<T>(message: &str) -> Result<T, Error> {
     Err(Error(message.into()))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub(crate) usize);
 impl NodeId {
     pub fn index(self) -> usize {
@@ -69,6 +69,47 @@ pub enum Operation {
         b: NodeId,
         signed: bool,
     },
+    /// The operand one clock cycle ago: a pipeline register, added by
+    /// [`crate::pipeline`]'s rewrite rules (never by `#[logic]`). Pure
+    /// evaluation, which has no clock, passes the operand through.
+    Reg(NodeId),
+}
+
+impl Operation {
+    /// This operation with each operand `id` replaced by `map(id)`.
+    pub fn remap(&self, mut map: impl FnMut(NodeId) -> NodeId) -> Operation {
+        match *self {
+            Operation::Input(index) => Operation::Input(index),
+            Operation::Constant(ref v) => Operation::Constant(v.clone()),
+            Operation::Not(a) => Operation::Not(map(a)),
+            Operation::Binary(op, a, b) => Operation::Binary(op, map(a), map(b)),
+            Operation::Mux { condition, yes, no } => Operation::Mux {
+                condition: map(condition),
+                yes: map(yes),
+                no: map(no),
+            },
+            Operation::Slice { value, offset } => Operation::Slice {
+                value: map(value),
+                offset,
+            },
+            Operation::Concat(a, b) => Operation::Concat(map(a), map(b)),
+            Operation::Shift {
+                value,
+                amount,
+                left,
+            } => Operation::Shift {
+                value: map(value),
+                amount,
+                left,
+            },
+            Operation::Mul { a, b, signed } => Operation::Mul {
+                a: map(a),
+                b: map(b),
+                signed,
+            },
+            Operation::Reg(a) => Operation::Reg(map(a)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +247,43 @@ impl Logic {
     pub fn nodes(&self) -> &[Node] {
         &self.nodes
     }
+    /// A graph from parts, checked: operands precede their nodes, ports
+    /// name valid nodes, widths are in range.
+    pub(crate) fn from_parts(
+        nodes: Vec<Node>,
+        inputs: Vec<Port>,
+        outputs: Vec<Port>,
+        schemas: Option<(Schema, Schema)>,
+    ) -> Result<Self, Error> {
+        for (i, node) in nodes.iter().enumerate() {
+            if !(1..=MAX_WIDTH).contains(&node.width)
+                || operands(&node.operation).iter().any(|id| id.0 >= i)
+            {
+                return fail("malformed logic graph");
+            }
+        }
+        if inputs
+            .iter()
+            .chain(&outputs)
+            .any(|p| p.value.0 >= nodes.len())
+        {
+            return fail("malformed logic graph");
+        }
+        Ok(Logic {
+            nodes,
+            inputs,
+            outputs,
+            schemas,
+            layout: std::sync::OnceLock::new(),
+            typed: std::sync::OnceLock::new(),
+        })
+    }
+    /// Whether the graph has pipeline registers (and so a clock).
+    pub fn is_clocked(&self) -> bool {
+        self.nodes
+            .iter()
+            .any(|n| matches!(n.operation, Operation::Reg(_)))
+    }
     pub fn inputs(&self) -> &[Port] {
         &self.inputs
     }
@@ -299,37 +377,7 @@ impl Logic {
             let id = if let Operation::Input(index) = node.operation {
                 self.outputs[index].value
             } else {
-                let map = |id: NodeId| mapped[id.0];
-                let operation = match node.operation {
-                    Operation::Constant(ref v) => Operation::Constant(v.clone()),
-                    Operation::Not(a) => Operation::Not(map(a)),
-                    Operation::Binary(op, a, b) => Operation::Binary(op, map(a), map(b)),
-                    Operation::Mux { condition, yes, no } => Operation::Mux {
-                        condition: map(condition),
-                        yes: map(yes),
-                        no: map(no),
-                    },
-                    Operation::Slice { value, offset } => Operation::Slice {
-                        value: map(value),
-                        offset,
-                    },
-                    Operation::Concat(a, b) => Operation::Concat(map(a), map(b)),
-                    Operation::Shift {
-                        value,
-                        amount,
-                        left,
-                    } => Operation::Shift {
-                        value: map(value),
-                        amount,
-                        left,
-                    },
-                    Operation::Mul { a, b, signed } => Operation::Mul {
-                        a: map(a),
-                        b: map(b),
-                        signed,
-                    },
-                    Operation::Input(_) => unreachable!(),
-                };
+                let operation = node.operation.remap(|id| mapped[id.0]);
                 let id = NodeId(result.nodes.len());
                 result.nodes.push(Node {
                     width: node.width,
@@ -361,10 +409,14 @@ impl Logic {
             return fail("invalid Verilog module identifier");
         }
         // Prefixing avoids Verilog keywords in Rust parameter names.
-        let ports: Vec<_> = self
-            .inputs
-            .iter()
-            .map(|p| format!("input wire [{}:0] i_{}", p.width - 1, p.name))
+        let clock = self.is_clocked().then(|| "input wire clk".to_string());
+        let ports: Vec<_> = clock
+            .into_iter()
+            .chain(
+                self.inputs
+                    .iter()
+                    .map(|p| format!("input wire [{}:0] i_{}", p.width - 1, p.name)),
+            )
             .chain(
                 self.outputs
                     .iter()
@@ -387,6 +439,19 @@ impl Logic {
         }
         for (index, node) in self.nodes.iter().enumerate() {
             let expr = match node.operation {
+                // No reset: the stall that pipelines a unit refills every
+                // register before its value is used.
+                Operation::Reg(a) => {
+                    writeln!(
+                        text,
+                        "reg [{w}:0] n{index} = {w1}'d0;\nalways @(posedge clk) n{index} <= n{a};",
+                        w = node.width - 1,
+                        w1 = node.width,
+                        a = a.0
+                    )
+                    .unwrap();
+                    continue;
+                }
                 Operation::Input(p) => format!("i_{}", self.inputs[p].name),
                 Operation::Constant(ref v) => v.to_verilog(node.width),
                 Operation::Not(a) => format!("~n{}", a.0),
@@ -453,6 +518,7 @@ fn compute_small(
     match *operation {
         Operation::Input(_) => unreachable!("inputs have no operands"),
         Operation::Constant(ref v) => v.to_u64().unwrap_or(0),
+        Operation::Reg(a) => value(a),
         Operation::Not(a) => !value(a),
         Operation::Binary(op, a, b) => {
             let (a, b) = (value(a), value(b));
@@ -514,6 +580,7 @@ fn compute<'a>(
     match *operation {
         Operation::Input(_) => unreachable!("inputs have no operands"),
         Operation::Constant(ref v) => bitvec::copy(out, v.words()),
+        Operation::Reg(a) => bitvec::copy(out, value(a)),
         Operation::Not(a) => bitvec::not(out, value(a), w),
         Operation::Binary(op, a, b) => {
             let (a, b) = (value(a), value(b));
@@ -571,10 +638,11 @@ fn compute<'a>(
     }
 }
 
-fn operands(operation: &Operation) -> Vec<NodeId> {
+pub(crate) fn operands(operation: &Operation) -> Vec<NodeId> {
     match *operation {
         Operation::Input(_) | Operation::Constant(_) => vec![],
         Operation::Not(a)
+        | Operation::Reg(a)
         | Operation::Slice { value: a, .. }
         | Operation::Shift { value: a, .. } => {
             vec![a]

@@ -106,8 +106,11 @@ fn derive_value(input: syn::DeriveInput) -> syn::Result<Tokens> {
             }
             fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
                 let mut values = ::std::vec::Vec::new();
-                #(values.extend(::bitlogic::LogicValue::flatten(&self.#names));)*
+                ::bitlogic::LogicValue::flatten_into(self, &mut values);
                 values
+            }
+            fn flatten_into(&self, out: &mut ::std::vec::Vec<::bitlogic::BitVec>) {
+                #(::bitlogic::LogicValue::flatten_into(&self.#names, out);)*
             }
             fn read(values: &mut impl ::std::iter::Iterator<Item=::bitlogic::BitVec>) -> ::std::result::Result<Self,::bitlogic::Error> {
                 Ok(Self { #(#names: <#types as ::bitlogic::LogicValue>::read(values)?),* })
@@ -154,6 +157,9 @@ fn derive_enum(name: &syn::Ident, data: &syn::DataEnum) -> syn::Result<Tokens> {
             }
             fn flatten(&self) -> ::std::vec::Vec<::bitlogic::BitVec> {
                 ::std::vec![::bitlogic::BitVec::from(::bitlogic::LogicValue::as_index(self).unwrap_or(0))]
+            }
+            fn flatten_into(&self, out: &mut ::std::vec::Vec<::bitlogic::BitVec>) {
+                out.push(::bitlogic::BitVec::from(::bitlogic::LogicValue::as_index(self).unwrap_or(0)));
             }
             fn as_index(&self) -> ::std::option::Option<u64> {
                 ::std::option::Option::Some(match self { #(Self::#idents => #values),* })

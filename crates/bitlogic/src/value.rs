@@ -499,6 +499,12 @@ pub trait LogicValue: Sized + 'static {
     fn schema() -> Schema;
     /// Leaf values in schema leaf order.
     fn flatten(&self) -> Vec<BitVec>;
+    /// Append the leaf values to `out`, as [`LogicValue::flatten`] would
+    /// return them, without an intermediate vector per field.
+    #[doc(hidden)]
+    fn flatten_into(&self, out: &mut Vec<BitVec>) {
+        out.extend(self.flatten());
+    }
     fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error>;
 
     /// The value of leaf values in schema leaf order (`u64`s or [`BitVec`]s).
@@ -541,6 +547,9 @@ impl LogicValue for bool {
     fn flatten(&self) -> Vec<BitVec> {
         vec![BitVec::from(*self)]
     }
+    fn flatten_into(&self, out: &mut Vec<BitVec>) {
+        out.push(BitVec::from(*self));
+    }
     fn as_index(&self) -> Option<u64> {
         Some(u64::from(*self))
     }
@@ -563,6 +572,9 @@ where
     fn flatten(&self) -> Vec<BitVec> {
         vec![self.to_bitvec()]
     }
+    fn flatten_into(&self, out: &mut Vec<BitVec>) {
+        out.push(self.to_bitvec());
+    }
     fn as_index(&self) -> Option<u64> {
         self.to_u64()
     }
@@ -579,7 +591,14 @@ impl<T: LogicValue, const N: usize> LogicValue for [T; N] {
         Schema::array::<T>(N)
     }
     fn flatten(&self) -> Vec<BitVec> {
-        self.iter().flat_map(LogicValue::flatten).collect()
+        let mut out = Vec::new();
+        self.flatten_into(&mut out);
+        out
+    }
+    fn flatten_into(&self, out: &mut Vec<BitVec>) {
+        for element in self {
+            element.flatten_into(out);
+        }
     }
     fn read(values: &mut impl Iterator<Item = BitVec>) -> Result<Self, Error> {
         let elements = (0..N)
